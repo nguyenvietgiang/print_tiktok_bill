@@ -30,3 +30,14 @@ sp bán lẻ.xlsx
 
 # ── IDE / Claude ──
 .claude/
+
+# ── Portable zip ──
+*.zip
+
+# ── JS / Node (đã xóa, phòng tránh add lại) ──
+login.js
+package.json
+package-lock.json
+
+# ── File cũ không dùng nữa ──
+bill_calculate/app.py

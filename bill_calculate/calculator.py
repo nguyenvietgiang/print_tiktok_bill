@@ -159,13 +159,35 @@ def build_sku_index(master_data: list[dict]) -> tuple[set[str], dict[str, str], 
 # PDF EXTRACTION
 # ============================================================
 
+def _parse_pdf_header(full_text: str) -> dict:
+    """
+    Trich xuat thong tin header tu Picking List PDF.
+    VD: Order quantity: 3 Product quantity: 3 Item quantity: 3
+    Tra ve: {order_qty, product_qty, item_qty, print_time}
+    """
+    info = {}
+    m = re.search(r'Order quantity:\s*(\d+)', full_text)
+    if m:
+        info['order_qty'] = int(m.group(1))
+    m = re.search(r'Product quantity:\s*(\d+)', full_text)
+    if m:
+        info['product_qty'] = int(m.group(1))
+    m = re.search(r'Item quantity:\s*(\d+)', full_text)
+    if m:
+        info['item_qty'] = int(m.group(1))
+    m = re.search(r'Print time:\s*(.+)', full_text)
+    if m:
+        info['print_time'] = m.group(1).strip()
+    return info
+
+
 def extract_order_counts(
     pdf_path: str,
     master_skus: set[str],
     prefix_map: dict[str, str],
     ambiguous_map: dict[str, list[str]],
     retail_lookup: dict[str, dict] | None = None,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict]:
     """
     Trich xuat so don hang cho moi Seller SKU tu PDF.
     Dung regex tim pattern: SellerSKU + Qty + OrderID (15+ chu so).
@@ -177,7 +199,7 @@ def extract_order_counts(
       4. Tim trong retail_lookup (san pham don le)
       5. Khong tim thay -> bo qua + canh bao
 
-    Tra ve: {seller_sku: tong_so_don_hang}
+    Tra ve: ({seller_sku: tong_so_qty}, {order_qty, product_qty, item_qty, print_time})
     """
     with pdfplumber.open(pdf_path) as pdf:
         texts = []
@@ -195,10 +217,6 @@ def extract_order_counts(
     pattern = r'\b((?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:-)?)\s+(\d+)\s+(\d{15,})'
 
     counts: dict[str, int] = defaultdict(int)
-
-    # Từ noise thường bị regex bắt nhầm thành SKU
-    NOISE_WORDS = {'combo', 'comboo', 'khong', 'kèm', 'quà', 'tặng', 'tặng)', 'cho', 'và',
-                   'image', 'product', 'picking', 'list', 'order', 'item', 'user', 'print'}
 
     for match in re.finditer(pattern, flat_text):
         candidate = match.group(1)
@@ -233,7 +251,8 @@ def extract_order_counts(
             # SKU la - khong co trong combo lan retail
             print(f"   ⚠ SKU la: {candidate} (x{qty}) - khong co trong ca 2 file")
 
-    return dict(counts)
+    header_info = _parse_pdf_header(full_text)
+    return dict(counts), header_info
 
 
 # ============================================================
@@ -298,95 +317,14 @@ def calculate_results(
     return results
 
 
-# ============================================================
-# EXCEL GENERATION
-# ============================================================
 
-def generate_excel(results: list[dict], output_path: str) -> str:
-    """
-    Tạo file Excel kết quả.
-    Format: Seller SKU | SKU | Qty | Qty Sold | Promo Qty
-    Dòng cuối: Tổng + SUM formula.
-    """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-
-    # ── Styles ──
-    hdr_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-    hdr_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-    hdr_align = Alignment(horizontal="center", vertical="center")
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-    data_font = Font(name="Arial", size=10)
-    total_font = Font(name="Arial", size=10, bold=True)
-
-    headers = ["STT", "Seller SKU", "SKU", "Tên sản phẩm", "Qty", "Qty Sold", "Promo Qty"]
-    col_widths = [5, 16, 12, 32, 7, 7, 7]  # tổng ~86 vừa A4 ngang
-    col_aligns = ['C', 'C', 'C', 'L', 'R', 'R', 'R']
-
-    # ── Header ──
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=ci, value=h)
-        c.font = hdr_font
-        c.fill = hdr_fill
-        c.alignment = hdr_align
-        c.border = thin_border
-
-    # ── Data ──
-    for ri, r in enumerate(results):
-        rn = ri + 2
-        vals = [ri + 1, r["seller_sku"], r["sku"], r.get("product_name", ""), r["qty"], r["qty_sold"], r["promo_qty"]]
-        for ci, v in enumerate(vals, 1):
-            c = ws.cell(row=rn, column=ci, value=v)
-            c.font = data_font
-            c.border = thin_border
-            ha = col_aligns[ci - 1] if ci <= len(col_aligns) else 'L'
-            c.alignment = Alignment(horizontal={'C':'center','L':'left','R':'right'}.get(ha, 'left'),
-                                    vertical='center',
-                                    wrap_text=(ci == 4))  # wrap cột Tên sản phẩm
-
-    # ── Total row ──
-    tr = len(results) + 2
-    tong_qty = sum(r["qty"] for r in results)
-    tong_sold = sum(r["qty_sold"] for r in results)
-    tong_promo = sum(r["promo_qty"] for r in results)
-
-    ws.cell(row=tr, column=1, value="Tổng").font = total_font
-    ws.cell(row=tr, column=1).border = thin_border
-    ws.cell(row=tr, column=2).border = thin_border  # Seller SKU trống
-    ws.cell(row=tr, column=3).border = thin_border  # SKU trống
-    ws.cell(row=tr, column=4).border = thin_border  # Tên sản phẩm trống
-
-    for ci, val in [(5, tong_qty), (6, tong_sold), (7, tong_promo)]:
-        c = ws.cell(row=tr, column=ci, value=val)
-        c.font = total_font
-        c.border = thin_border
-
-    # ── Column widths ──
-    for ci, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── Print setup: vừa trang in, tránh mất cột ──
-    ws.page_setup.orientation = 'landscape'
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.page_setup.paperSize = 9  # A4
-
-    wb.save(output_path)
-    print(f"   📊 Đã tạo Excel: {os.path.basename(output_path)}")
-    return output_path
-
-
-def generate_grouped_excel(results: list[dict], output_path: str, carrier: str = '', source_label: str = '') -> str:
+def generate_grouped_excel(results: list[dict], output_path: str, carrier: str = '', source_label: str = '', order_count: int = 0) -> str:
     """
     Tạo file Excel gộp theo SKU (không hiện Seller SKU).
     Format: SKU | Đơn vị tính | Qty | Qty Sold | Promo Qty
     Có dòng tiêu đề in đậm ở đầu để nhận diện khi in giấy.
     """
-    # Gộp theo SKU (giống logic generate_grouped_pdf)
+    # Gộp theo SKU
     grouped = {}
     for r in results:
         sku = r["sku"]
@@ -421,7 +359,12 @@ def generate_grouped_excel(results: list[dict], output_path: str, carrier: str =
 
     # ── Title row (dòng nhận diện khi in giấy) ──
     ncols = 7  # STT, SKU, Tên SP, ĐVT, SL, SL bán, SL KM
-    title_text = f'{carrier} — {source_label}' if carrier and source_label else (carrier or source_label or 'Báo cáo gộp SKU')
+    if carrier and source_label:
+        title_text = f'{carrier} — {source_label}'
+    else:
+        title_text = carrier or source_label or 'Báo cáo gộp SKU'
+    if order_count > 0:
+        title_text += f' — ({order_count} đơn)'
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
     c = ws.cell(row=1, column=1, value=title_text)
     c.font = title_font
@@ -488,387 +431,77 @@ def generate_grouped_excel(results: list[dict], output_path: str, carrier: str =
 
 
 # ============================================================
-# FONT HELPER
+# PDF GENERATION (gộp theo SKU)
 # ============================================================
 
-def _find_font(bold: bool = False) -> tuple[str, str]:
-    """Tìm font Arial trên Windows, fallback về Helvetica (FPDF built-in)."""
-    if bold:
-        paths = [r"C:\Windows\Fonts\Arialbd.ttf", r"C:\Windows\Fonts\Arial Bold.ttf"]
-    else:
-        paths = [r"C:\Windows\Fonts\Arial.ttf", r"C:\Windows\Fonts\Arial Regular.ttf"]
-    for p in paths:
-        if os.path.exists(p):
-            return "Arial", p
-    return "Helvetica", None
-
-
-# ============================================================
-# PDF GENERATION
-# ============================================================
-
-def generate_pdf(results: list[dict], output_path: str) -> str:
-    """Tạo file PDF báo cáo đã tách SKU."""
-    print(f"   📝 Tạo PDF: {os.path.basename(output_path)}")
-
-    pdf = FPDF(orientation='P', unit='pt', format='Letter')
-    pdf.set_auto_page_break(auto=True, margin=40)
-
-    # Dùng font Arial TTF với unicode (hỗ trợ tiếng Việt)
-    font_path = r"C:\Windows\Fonts\Arial.ttf"
-    font_bold_path = r"C:\Windows\Fonts\Arialbd.ttf"
-    font_name = 'Arial'
-    font_bold = 'ArialBold'
-
-    if os.path.exists(font_path):
-        pdf.add_font(font_name, '', font_path, uni=True)
-    else:
-        font_name = 'Helvetica'
-
-    if os.path.exists(font_bold_path):
-        pdf.add_font(font_bold, 'B', font_bold_path, uni=True)
-    else:
-        font_bold = 'Helvetica'
-
-    pdf.add_page()
-
-    GRAY, BLACK = (100, 100, 100), (0, 0, 0)
-
-    # Header
-    pdf.set_font(font_name, "", 8)
-    pdf.set_text_color(*GRAY)
-    pdf.set_xy(0, 16)
-    pdf.cell(612, 10, "                                     Traphaco ~ Danh sách đơn hàng ~ Haravan", align="C")
-
-    y = 37
-    pdf.set_text_color(*BLACK)
-    pdf.set_font(font_bold, "B", 13.5)
-    pdf.set_xy(28.5, y)
-    pdf.cell(0, 18, "Traphaco")
-    y += 18
-
-    pdf.set_font(font_name, "", 9)
-    for line in [
-        f"Ngày in phiếu: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
-        "Người in: Trường Lê",
-        "Địa chỉ: Ngõ 15 Ngọc Hồi, Phường Hoàng Liệt, Quận Hoàng Mai, Hà Nội, Vietnam",
-        "Điện thoại: 0989821222",
-    ]:
-        pdf.set_xy(28.5, y)
-        pdf.cell(0, 12, line)
-        y += 12
-    y += 21
-
-    pdf.set_font(font_bold, "B", 21)
-    pdf.set_xy(0, y)
-    pdf.cell(612, 28, "Danh sách sản phẩm", align="C")
-    y += 60
-
-    # ── Table ──
-    ROW_H = 22
-    RIGHT = 583.5
-    # (label, x, width, align) — align áp dụng cho cả header & data
-    col_defs = [
-        ("STT",        28.5,  30, "R"),
-        ("Seller SKU", 66.5, 135, "L"),
-        ("SKU",       209.5, 100, "L"),
-        ("Qty",       317.5,  80, "R"),
-        ("Qty Sold",  405.5,  85, "R"),
-        ("Promo Qty", 498.5,  85, "R"),
-    ]
-
-    def draw_header(yy):
-        pdf.set_draw_color(*BLACK)
-        pdf.set_line_width(0.5)
-        pdf.line(28.5, yy, RIGHT, yy)
-        pdf.set_font(font_bold, "B", 8)
-        for label, x, w, align in col_defs:
-            pdf.set_xy(x, yy + 2)
-            pdf.cell(w, ROW_H, label, align=align)
-        return yy + ROW_H
-
-    y = draw_header(y)
-    pdf.line(28.5, y, RIGHT, y)
-
-    pdf.set_font(font_name, "", 8)
-    tong_qty = tong_sold = tong_promo = 0
-
-    for i, r in enumerate(results, 1):
-        if y > 720:
-            pdf.line(28.5, y, RIGHT, y)
-            pdf.add_page()
-            y = 40
-            y = draw_header(y)
-            pdf.line(28.5, y, RIGHT, y)
-            pdf.set_font(font_name, "", 8)
-
-        row_vals = [str(i), r["seller_sku"], r["sku"],
-                    str(r["qty"]), str(r["qty_sold"]), str(r["promo_qty"])]
-        for (_, x, w, align), v in zip(col_defs, row_vals):
-            pdf.set_xy(x, y + 2)
-            pdf.cell(w, ROW_H, v, align=align)
-
-        tong_qty += r["qty"]
-        tong_sold += r["qty_sold"]
-        tong_promo += r["promo_qty"]
-        y += ROW_H
-
-    pdf.line(28.5, y, RIGHT, y)
-    y += 6
-    pdf.set_font(font_bold, "B", 8)
-
-    total_cells = [
-        ("Tổng", col_defs[2][1], col_defs[2][2], "L"),
-        (str(tong_qty), col_defs[3][1], col_defs[3][2], "R"),
-        (str(tong_sold), col_defs[4][1], col_defs[4][2], "R"),
-        (str(tong_promo), col_defs[5][1], col_defs[5][2], "R"),
-    ]
-    for txt, x, w, align in total_cells:
-        pdf.set_xy(x, y)
-        pdf.cell(w, ROW_H, txt, align=align)
-
-    # Footer
-    pdf.set_font(font_name, "", 8)
-    pdf.set_text_color(*GRAY)
-    pdf.set_xy(0, y + 30)
-    pdf.cell(612, 10, "https://traphaco.myharavan.com/admin/orders                                                    1/1", align="C")
-
-    pdf.output(output_path)
-    return output_path
-
-
-# ============================================================
-# TXT GENERATION
-# ============================================================
-
-def generate_txt(results: list[dict], output_path: str) -> str:
-    """Tạo file TXT báo cáo."""
-    print(f"   📄 Tạo TXT: {os.path.basename(output_path)}")
-
-    tong_qty = sum(r["qty"] for r in results)
-    tong_sold = sum(r["qty_sold"] for r in results)
-    tong_promo = sum(r["promo_qty"] for r in results)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("Danh sách sản phẩm đã đối chiếu với Master Data\n")
-        f.write(f"Thời gian: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-        f.write(f"Số dòng: {len(results)}\n")
-        f.write(f"Tổng Qty: {tong_qty}  |  Qty Sold: {tong_sold}  |  Promo Qty: {tong_promo}\n")
-        f.write(f"{'=' * 75}\n")
-        f.write(f"{'STT':<6} {'Seller SKU':<18} {'SKU':<14} {'Qty':>6} {'Sold':>6} {'Promo':>6}\n")
-        f.write(f"{'-' * 75}\n")
-        for i, r in enumerate(results, 1):
-            f.write(f"{i:<6} {r['seller_sku']:<18} {r['sku']:<14} "
-                    f"{r['qty']:>6} {r['qty_sold']:>6} {r['promo_qty']:>6}\n")
-    return output_path
-
-
-# ============================================================
-# GROUPED PDF (gộp theo SKU, bỏ cột Seller SKU)
-# ============================================================
-
-def generate_grouped_pdf(results: list[dict], output_path: str) -> str:
-    """Tạo PDF báo cáo đã gộp theo SKU (không hiện Seller SKU)."""
-    print(f"   📝 Tạo PDF gộp: {os.path.basename(output_path)}")
-
+def generate_grouped_pdf(results: list[dict], output_path: str, carrier: str = '', source_label: str = '', order_count: int = 0) -> str:
+    """Tạo file PDF báo cáo gộp theo SKU."""
     # Gộp theo SKU
     grouped = {}
     for r in results:
         sku = r["sku"]
         if sku not in grouped:
-            grouped[sku] = {"qty": 0, "qty_sold": 0, "promo_qty": 0}
+            grouped[sku] = {"qty": 0, "qty_sold": 0, "promo_qty": 0, "unit": r.get("unit", ""), "product_name": r.get("product_name", "")}
         grouped[sku]["qty"] += r["qty"]
         grouped[sku]["qty_sold"] += r["qty_sold"]
         grouped[sku]["promo_qty"] += r["promo_qty"]
+        if not grouped[sku]["product_name"] and r.get("product_name", ""):
+            grouped[sku]["product_name"] = r["product_name"]
 
     grouped_list = [{"sku": k, **v} for k, v in grouped.items()]
-    # Sắp xếp theo SKU
     grouped_list.sort(key=lambda x: x["sku"])
 
-    pdf = FPDF(orientation='P', unit='pt', format='Letter')
-    pdf.set_auto_page_break(auto=True, margin=40)
-
-    font_path = r"C:\Windows\Fonts\Arial.ttf"
-    font_bold_path = r"C:\Windows\Fonts\Arialbd.ttf"
-    font_name = 'Arial'
-    font_bold = 'ArialBold'
-
-    if os.path.exists(font_path):
-        pdf.add_font(font_name, '', font_path, uni=True)
-    else:
-        font_name = 'Helvetica'
-
-    if os.path.exists(font_bold_path):
-        pdf.add_font(font_bold, 'B', font_bold_path, uni=True)
-    else:
-        font_bold = 'Helvetica'
-
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=10)
+    pdf.add_font('Arial', '', r'C:\Windows\Fonts\Arial.ttf', uni=True)
+    pdf.add_font('Arial', 'B', r'C:\Windows\Fonts\Arialbd.ttf', uni=True)
     pdf.add_page()
 
-    GRAY, BLACK = (100, 100, 100), (0, 0, 0)
+    # Tiêu đề
+    if carrier and source_label:
+        title = f'{carrier} — {source_label}'
+    else:
+        title = carrier or source_label or 'Bao cao gop SKU'
+    if order_count > 0:
+        title += f' — ({order_count} don)'
+    pdf.set_font('Arial', 'B', 14)
+    pdf.cell(0, 10, title, align='C')
+    pdf.ln(12)
 
-    # Header
-    pdf.set_font(font_name, "", 8)
-    pdf.set_text_color(*GRAY)
-    pdf.set_xy(0, 16)
-    pdf.cell(612, 10, "                                     Traphaco ~ Danh sách đơn hàng ~ Haravan", align="C")
+    # Bảng — tận dụng tối đa chiều ngang A4 (297mm)
+    col_w = [10, 28, 155, 24, 16, 18, 18]  # STT, SKU, Ten SP, DVT, SL, SL ban, SL KM
+    headers = ['STT', 'SKU', 'Ten SP', 'DVT', 'SL', 'SL ban', 'SL KM']
+    pdf.set_font('Arial', 'B', 8)
+    pdf.set_fill_color(47, 84, 150)
+    pdf.set_text_color(255, 255, 255)
+    for i, (h, w) in enumerate(zip(headers, col_w)):
+        pdf.cell(w, 10, h, border=1, fill=True, align='C')
+    pdf.ln()
 
-    y = 37
-    pdf.set_text_color(*BLACK)
-    pdf.set_font(font_bold, "B", 13.5)
-    pdf.set_xy(28.5, y); pdf.cell(0, 18, "Traphaco")
-    y += 18
-
-    pdf.set_font(font_name, "", 9)
-    for line in [
-        f"Ngày in phiếu: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
-        "Người in: Trường Lê",
-        "Địa chỉ: Ngõ 15 Ngọc Hồi, P.Hoàng Liệt, Q.Hoàng Mai, Hà Nội",
-        "Điện thoại: 0989821222",
-    ]:
-        pdf.set_xy(28.5, y); pdf.cell(0, 12, line)
-        y += 12
-    y += 21
-
-    pdf.set_font(font_bold, "B", 16)
-    pdf.set_xy(0, y); pdf.cell(612, 28, "Danh sách sản phẩm (gộp theo SKU)", align="C")
-    y += 60
-
-    # ── Table ──
-    ROW_H = 24
-    RIGHT = 583.5
-    col_defs = [
-        ("STT",    28.5,  40, "R"),
-        ("SKU",    76.5, 160, "L"),
-        ("Qty",   244.5, 100, "R"),
-        ("Qty Sold", 352.5, 110, "R"),
-        ("Promo Qty", 470.5, 110, "R"),
-    ]
-
-    def draw_header(yy):
-        pdf.set_draw_color(*BLACK); pdf.set_line_width(0.5)
-        pdf.line(28.5, yy, RIGHT, yy)
-        pdf.set_font(font_bold, "B", 9)
-        for label, x, w, align in col_defs:
-            pdf.set_xy(x, yy + 2); pdf.cell(w, ROW_H, label, align=align)
-        return yy + ROW_H
-
-    y = draw_header(y)
-    pdf.line(28.5, y, RIGHT, y)
-    pdf.set_font(font_name, "", 9)
+    # Data
+    pdf.set_font('Arial', '', 9)
+    pdf.set_text_color(0, 0, 0)
     tong_qty = tong_sold = tong_promo = 0
-
     for i, r in enumerate(grouped_list, 1):
-        if y > 720:
-            pdf.line(28.5, y, RIGHT, y); pdf.add_page(); y = 40
-            y = draw_header(y)
-            pdf.line(28.5, y, RIGHT, y); pdf.set_font(font_name, "", 9)
+        vals = [str(i), r['sku'], r.get('product_name', ''), r.get('unit', ''),
+                str(r['qty']), str(r['qty_sold']), str(r['promo_qty'])]
+        aligns = ['C', 'L', 'L', 'C', 'R', 'R', 'R']
+        for v, w, a in zip(vals, col_w, aligns):
+            pdf.cell(w, 9, v, border=1, align=a)
+        pdf.ln()
+        tong_qty += r['qty']; tong_sold += r['qty_sold']; tong_promo += r['promo_qty']
 
-        row_vals = [str(i), r["sku"], str(r["qty"]), str(r["qty_sold"]), str(r["promo_qty"])]
-        for (_, x, w, align), v in zip(col_defs, row_vals):
-            pdf.set_xy(x, y + 2); pdf.cell(w, ROW_H, v, align=align)
-
-        tong_qty += r["qty"]; tong_sold += r["qty_sold"]; tong_promo += r["promo_qty"]
-        y += ROW_H
-
-    pdf.line(28.5, y, RIGHT, y); y += 6
-    pdf.set_font(font_bold, "B", 9)
-
-    total_cells = [
-        ("Tổng", col_defs[1][1], col_defs[1][2], "L"),
-        (str(tong_qty), col_defs[2][1], col_defs[2][2], "R"),
-        (str(tong_sold), col_defs[3][1], col_defs[3][2], "R"),
-        (str(tong_promo), col_defs[4][1], col_defs[4][2], "R"),
-    ]
-    for txt, x, w, align in total_cells:
-        pdf.set_xy(x, y); pdf.cell(w, ROW_H, txt, align=align)
-
-    pdf.set_font(font_name, "", 8)
-    pdf.set_text_color(*GRAY)
-    pdf.set_xy(0, y + 30)
-    pdf.cell(612, 10, "https://traphaco.myharavan.com/admin/orders                                                    1/1", align="C")
+    # Total
+    pdf.set_font('Arial', 'B', 9)
+    total_vals = ['', 'Tong', '', '', str(tong_qty), str(tong_sold), str(tong_promo)]
+    total_aligns = ['C', 'L', 'C', 'C', 'R', 'R', 'R']
+    for v, w, a in zip(total_vals, col_w, total_aligns):
+        pdf.cell(w, 10, v, border=1, align=a)
 
     pdf.output(output_path)
+    print(f'   📄 Đã tạo PDF: {output_path}')
     return output_path
 
-
-# ============================================================
-# SINGLE PDF PIPELINE
-# ============================================================
-
-def process_single_pdf(
-    pdf_path: str,
-    output_dir: str,
-    master_data: list[dict],
-    master_skus: set[str],
-    prefix_map: dict[str, str],
-    ambiguous_map: dict[str, list[str]],
-    retail_lookup: dict[str, dict] | None = None,
-    carrier: str = '',
-) -> dict | None:
-    """
-    Xu ly 1 file PDF: trich xuat -> doi chieu -> xuat file.
-    Tra ve dict thong tin ket qua, hoac None neu khong co du lieu.
-    """
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    print(f"\nXu ly: {os.path.basename(pdf_path)}")
-
-    # B1: Trich xuat
-    order_counts = extract_order_counts(pdf_path, master_skus, prefix_map, ambiguous_map, retail_lookup)
-    if not order_counts:
-        print(f"   ⚠ Khong tim thay Seller SKU nao trong PDF!")
-        return None
-
-    print(f"   Tim thay {len(order_counts)} Seller SKU, "
-          f"tong {sum(order_counts.values())} don hang")
-
-    # B2: Tinh toan
-    results = calculate_results(master_data, order_counts, retail_lookup)
-    print(f"   📊 Kết quả: {len(results)} dòng")
-
-    # B3: Xuất file
-    # B3: Xuất file — tên rõ ràng, phân biệt với PDF gốc
-    # Tên file có gắn tên carrier để phân biệt khi có nhiều đơn vị vận chuyển
-    carrier_safe = carrier.replace(' ', '_').replace('&', 'n') if carrier else ''
-
-    # Bỏ carrier prefix khỏi base_name nếu đã có (tránh lặp)
-    clean_name = base_name
-    if carrier_safe and base_name.startswith(carrier_safe + '_'):
-        clean_name = base_name[len(carrier_safe) + 1:]
-
-    # Trích timestamp: hỗ trợ cả định dạng TikTok (MM-DD_HH-MM-SS) và định dạng cũ (YYYYMMDD_HHMMSS)
-    ts_match = re.search(r'(\d{2}-\d{2}_\d{2}-\d{2}-\d{2}|\d{8}_\d{6})', clean_name)
-    ts = ts_match.group(1) if ts_match else clean_name
-
-    prefix = f"Bao_cao_gop_SKU_{carrier_safe}_" if carrier_safe else "Bao_cao_gop_SKU_"
-    excel_grouped_path = os.path.join(output_dir, f"{prefix}{ts}.xlsx")
-
-    # Tạo label nhận diện cho dòng tiêu đề trong Excel (hiển thị khi in giấy)
-    # clean_name VD: "06-30_14-11-10_Picking list_1"
-    # Chuyển thành: "Picking list 1 — 30/06 14:11"
-    label_match = re.search(r'(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_(.+)', clean_name)
-    if label_match:
-        mm, dd, hh, mi, ss = label_match.group(1), label_match.group(2), label_match.group(3), label_match.group(4), label_match.group(5)
-        remainder = label_match.group(6).replace('_', ' ')
-        source_label = f'{remainder} — {dd}/{mm} {hh}:{mi}'
-    else:
-        source_label = clean_name.replace('_', ' ')
-
-    # Chỉ xuất file Excel gộp theo SKU (không cột Seller SKU)
-    # generate_pdf(results, pdf_out_path)
-    # generate_grouped_pdf(results, pdf_grouped_path)
-    generate_grouped_excel(results, excel_grouped_path, carrier=carrier, source_label=source_label)
-
-    return {
-        "base_name": base_name,
-        "rows": len(results),
-        "tong_qty": sum(r["qty"] for r in results),
-        "tong_sold": sum(r["qty_sold"] for r in results),
-        "tong_promo": sum(r["promo_qty"] for r in results),
-        "files": {
-            "excel": excel_grouped_path,
-        },
-    }
 
 
 # ============================================================
@@ -883,16 +516,9 @@ def process_all(
     carrier: str = '',
 ) -> list[dict]:
     """
-    Xu ly toan bo pipeline cho nhieu file PDF.
-    Moi PDF duoc doi chieu doc lap voi master_data va sinh file ket qua rieng.
-
-    Args:
-        pdf_files: danh sach duong dan file PDF
-        output_dir: thu muc xuat ket qua
-        master_path: duong dan ma combo.xlsx (combo)
-        retail_path: duong dan sp ban le.xlsx (don le)
+    Xu ly toan bo pipeline cho nhieu file PDF cung 1 carrier.
+    TAT CA PDF duoc gop chung vao 1 file bao cao duy nhat.
     """
-    # Xac dinh master_path
     if master_path is None:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         master_path = os.path.join(base, "master_data.xlsx")
@@ -907,26 +533,62 @@ def process_all(
     print(f"   {len(master_data)} dong, {len(master_skus)} Seller SKU"
           + (f", {len(prefix_map)} prefix map" if prefix_map else ""))
 
-    # Load retail data (san pham ban le)
+    # Load retail data
     retail_lookup = None
     if retail_path and os.path.exists(retail_path):
         retail_lookup = load_retail_data(retail_path)
     elif retail_path:
         print(f"   ⚠ Khong tim thay file retail: {retail_path}")
 
-    # Xu ly tung PDF
-    all_results = []
-    for pdf_path in pdf_files:
-        result = process_single_pdf(pdf_path, output_dir,
-                                    master_data, master_skus, prefix_map, ambiguous_map, retail_lookup, carrier)
-        if result:
-            all_results.append(result)
+    # Gom order_counts tu TAT CA PDF
+    from collections import defaultdict
+    merged_order_counts: dict[str, int] = defaultdict(int)
+    total_order_qty = 0   # Số đơn hàng thực tế (Order quantity từ header)
 
-    if not all_results:
+    for pdf_path in pdf_files:
+        print(f"\nXu ly: {os.path.basename(pdf_path)}")
+        order_counts, header_info = extract_order_counts(pdf_path, master_skus, prefix_map, ambiguous_map, retail_lookup)
+        if not order_counts:
+            print(f"   ⚠ Khong tim thay Seller SKU nao trong PDF!")
+            continue
+        for sku, count in order_counts.items():
+            merged_order_counts[sku] += count
+        order_qty = header_info.get('order_qty', 0)
+        total_order_qty += order_qty
+        print(f"   Tim thay {len(order_counts)} Seller SKU, {order_qty} don hang (header), {sum(order_counts.values())} mat hang")
+
+    if not merged_order_counts:
         raise ValueError("Không trích xuất được dữ liệu từ bất kỳ PDF nào. "
                          "Kiểm tra file đầu vào và master_data.")
 
-    return all_results
+    # Tinh toan tu merged order counts
+    results = calculate_results(master_data, dict(merged_order_counts), retail_lookup)
+    print(f"\n📊 KET QUA CHUNG: {len(results)} dong | "
+          f"Qty={sum(r['qty'] for r in results)} | "
+          f"Sold={sum(r['qty_sold'] for r in results)} | "
+          f"Promo={sum(r['promo_qty'] for r in results)}")
+
+    # Sinh 1 file PDF duy nhat
+    now = datetime.now()
+    carrier_safe = carrier.replace(' ', '_').replace('&', 'n') if carrier else ''
+    prefix = f"Bao_cao_gop_SKU_{carrier_safe}_" if carrier_safe else "Bao_cao_gop_SKU_"
+    pdf_path = os.path.join(output_dir, f"{prefix}{now.strftime('%m-%d_%H-%M-%S')}.pdf")
+
+    if carrier:
+        source_label = f"{len(pdf_files)} Picking list — {now.strftime('%d/%m %H:%M')}"
+    else:
+        source_label = f"{len(pdf_files)} Picking list — {now.strftime('%d/%m %H:%M')}"
+
+    generate_grouped_pdf(results, pdf_path, carrier=carrier, source_label=source_label, order_count=total_order_qty)
+
+    return [{
+        "base_name": f"Combined {carrier or 'all'}",
+        "rows": len(results),
+        "tong_qty": sum(r["qty"] for r in results),
+        "tong_sold": sum(r["qty_sold"] for r in results),
+        "tong_promo": sum(r["promo_qty"] for r in results),
+        "files": {"pdf_report": pdf_path},
+    }]
 
 
 # ============================================================
