@@ -433,7 +433,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 total_printed += checked; log_cb(f'  📊 Đã chọn {checked} đơn (test mode — không in)', 'info'); break
 
             state_cb('printing', f'Batch {batch_num}: Đang in...')
-            page.wait_for_timeout(2000)  # Đợi TikTok UI phản ứng sau khi chọn đơn
+            page.wait_for_timeout(5000)  # Đợi TikTok UI phản ứng sau khi chọn đơn
             ship_btn = None
             for btn_text in ['Sắp xếp vận chuyển và in', 'Arrange shipment and print', 'Sắp xếp vận chuyển']:
                 try:
