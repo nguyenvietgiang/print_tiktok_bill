@@ -38,32 +38,28 @@ UPLOAD_DIR = BILL_DIR / 'uploads'
 sys.path.insert(0, str(BILL_DIR))
 
 try:
-    from calculator import process_all
+    from calculator import process_all, extract_report_data, aggregate_reports
 except ImportError:
     process_all = None
+    extract_report_data = None
+    aggregate_reports = None
 
 # ═══════════════════════════════════════════════════════════
 # Frozen / source mode — detect paths
 # ═══════════════════════════════════════════════════════════
 if getattr(sys, 'frozen', False):
-    _portable_browsers = os.path.join(os.path.dirname(sys.executable), 'ms-playwright')
-    if os.path.isdir(_portable_browsers):
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = _portable_browsers
-    else:
-        os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH',
-            os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'ms-playwright'))
     BASE_DIR = Path(sys.executable).parent
     BILL_DIR = BASE_DIR / 'bill_calculate'
     UPLOAD_DIR = BILL_DIR / 'uploads'
     DEFAULT_COOKIE = Path(sys._MEIPASS) / 'seller-vn.tiktok.com_25-06-2026.json'
     MASTER_DEFAULT = Path(sys._MEIPASS) / 'mã combo.xlsx'
     RETAIL_DEFAULT = Path(sys._MEIPASS) / 'sp bán lẻ.xlsx'
+    TEMPLATE_DEFAULT = Path(sys._MEIPASS) / 'Bảng thống kê hàng.xlsx'
 else:
-    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH',
-        os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'ms-playwright'))
     DEFAULT_COOKIE = BASE_DIR / 'seller-vn.tiktok.com_25-06-2026.json'
     MASTER_DEFAULT = BASE_DIR / 'mã combo.xlsx'
     RETAIL_DEFAULT = BASE_DIR / 'sp bán lẻ.xlsx'
+    TEMPLATE_DEFAULT = BASE_DIR / 'Bảng thống kê hàng.xlsx'
 
 TARGET_URL = 'https://seller-vn.tiktok.com'
 ORDERS_URL = 'https://seller-vn.tiktok.com/order?order_status%5B%5D=1&selected_sort=11&tab=to_ship&page_size=50'
@@ -82,8 +78,69 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ============================================================
 # AUTOMATION
 # ============================================================
+def _detect_captcha(page, log_cb, state_cb, stop_event):
+    """Kiểm tra xem TikTok có hiện CAPTCHA không. Nếu có → dừng chờ user giải."""
+    captcha_selectors = [
+        # TikTok slider CAPTCHA
+        'iframe[src*="captcha"]',
+        'iframe[src*="verify"]',
+        'div[class*="captcha"]',
+        'div[class*="verify"]',
+        'div[class*="slider"]',
+        # Text-based detection
+        'text=Kéo thanh trượt',
+        'text=Kéo để xác',
+        'text=Trượt để xác',
+        'text=Slide to verify',
+        'text=Please verify',
+        'text=Xác minh',
+        # Common CAPTCHA container IDs
+        '#captcha',
+        '#captcha-container',
+        '.captcha_verify',
+        '[data-testid="captcha"]',
+    ]
+    for selector in captcha_selectors:
+        try:
+            el = page.locator(selector).first
+            if el.count() > 0 and el.is_visible(timeout=1000):
+                # Có CAPTCHA!
+                log_cb('🛑 PHÁT HIỆN CAPTCHA! Vui lòng kéo hình xác minh trên Chrome...', 'err')
+                state_cb('captcha', '⏳ Đợi bạn giải CAPTCHA...')
+                # Chụp màn hình
+                try:
+                    ss = f'captcha_{datetime.now().strftime("%m-%d_%H-%M-%S")}.png'
+                    page.screenshot(path=ss)
+                    log_cb(f'  📸 Screenshot: {ss}', 'info')
+                except: pass
+                # Đợi user giải CAPTCHA (polling mỗi 2s, tối đa 5 phút)
+                import time as _t
+                for _ in range(150):  # 150 × 2s = 5 phút
+                    if stop_event and stop_event.is_set():
+                        return
+                    _t.sleep(2)
+                    # Kiểm tra CAPTCHA đã biến mất chưa
+                    try:
+                        if el.count() == 0 or not el.is_visible(timeout=500):
+                            log_cb('✅ CAPTCHA đã được giải — đợi 5s để trang load lại...', 'ok')
+                            state_cb('running', 'Đang đợi trang load lại...')
+                            page.wait_for_timeout(5000)
+                            state_cb('running', 'Đang tiếp tục...')
+                            return
+                    except:
+                        log_cb('✅ CAPTCHA đã được giải — đợi 5s để trang load lại...', 'ok')
+                        state_cb('running', 'Đang đợi trang load lại...')
+                        page.wait_for_timeout(5000)
+                        state_cb('running', 'Đang tiếp tục...')
+                        return
+                log_cb('⚠ Hết thời gian chờ CAPTCHA — thử tiếp...', 'warn')
+                return
+        except Exception:
+            continue
+
 def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_event=None,
-                   existing_playwright=None, existing_browser=None, carrier=None, test_mode=False):
+                   existing_playwright=None, existing_browser=None, carrier=None, test_mode=False,
+                   exclude_pre_orders=True):
     with open(cookie_path, 'r', encoding='utf-8') as f:
         cd = json.load(f)
     cookies_list = cd.get('cookies', cd if isinstance(cd, list) else [])
@@ -92,8 +149,11 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
     target = max_orders if max_orders > 0 else 10**9
     use_select_all = (max_orders == 0)
     batch_num = 0
+    select_all_batches = 0  # Đếm số batch khi dùng "Chọn tất cả" — chống loop vô hạn
     carrier_label = f' [{carrier}]' if carrier else ''
     orders_url = CARRIER_URLS.get(carrier, ORDERS_URL)
+    if exclude_pre_orders:
+        orders_url += '&order_exclusion%5B%5D=1'  # Loại trừ đơn bán trước
     if stop_event is None: stop_event = threading.Event()
 
     # ── Khởi tạo / tái sử dụng browser ──
@@ -123,21 +183,31 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         pass
             page.goto(orders_url, wait_until='networkidle', timeout=60000)
             page.wait_for_timeout(4000)
+            _detect_captcha(page, log_cb, state_cb, stop_event)
             browser_ok = True
-        except Exception:
-            log_cb('⚠ Không dùng lại được browser cũ — tạo mới...', 'warn')
+        except Exception as e:
+            log_cb(f'⚠ Không dùng lại được browser cũ ({e}) — tạo mới...', 'warn')
+            # QUAN TRỌNG: chỉ close browser, KHÔNG stop playwright
+            # stop() gọi vào native code dễ gây crash nếu driver đang dở việc
             try:
                 existing_browser.close()
-            except: pass
-            try:
-                existing_playwright.stop()
-            except: pass
+            except Exception:
+                pass
+            # Đợi browser process thoát hẳn trước khi tạo mới
+            import time as _time
+            _time.sleep(0.5)
             existing_browser = None
             existing_playwright = None
 
     if not browser_ok:
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(headless=False, args=['--disable-blink-features=AutomationControlled'])
+        try:
+            playwright = sync_playwright().start()
+            launch_opts = {'headless': False, 'channel': 'chrome', 'args': ['--disable-blink-features=AutomationControlled']}
+            log_cb('🌐 Dùng Google Chrome có sẵn trên máy', 'info')
+            browser = playwright.chromium.launch(**launch_opts)
+        except Exception as e:
+            log_cb(f'✗ Không thể khởi động browser: {e}', 'err')
+            raise RuntimeError(f'Không thể khởi động Chromium: {e}') from e
         context = browser.new_context(viewport={'width': 1366, 'height': 768},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
             accept_downloads=True)
@@ -155,6 +225,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
         page = context.new_page()
         page.goto(TARGET_URL, wait_until='domcontentloaded', timeout=30000)
         page.wait_for_timeout(2000)
+        _detect_captcha(page, log_cb, state_cb, stop_event)
 
     try:
         while total_printed < target:
@@ -179,6 +250,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         log_cb(f'  ✗ Thất bại sau {MAX_GOTO_RETRIES} lần thử: {e}', 'err')
                         raise
             page.wait_for_timeout(4000)
+            _detect_captcha(page, log_cb, state_cb, stop_event)
 
             total_avail = page.evaluate("() => document.querySelectorAll('td.col-checkbox label.p-checkbox').length")
             if total_avail == 0:
@@ -225,44 +297,118 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         return false;
                     }''')
                     if header_clicked: log_cb('  ✓ Đã click checkbox header (JS fallback)', 'ok')
-                page.wait_for_timeout(2500)
+                page.wait_for_timeout(3500)
 
+                # ── Đếm số đơn đã được chọn sau khi click header checkbox ──
+                # Nếu trang không đầy (số đơn ít hơn page_size) → tất cả đơn
+                # đã hiển thị trên 1 trang, không cần bấm "Chọn tất cả".
+                # Bấm "Chọn tất cả" khi trang không đầy sẽ bị TOGGLE OFF → mất hết checkbox!
+                header_checked = page.evaluate("""() => {
+                    // Đếm row đã chọn — KHÔNG đếm header checkbox (trong thead/th)
+                    // Dùng tr.p-highlight trước vì header row không có class này
+                    let n = document.querySelectorAll('tr.p-highlight, tr.p-selectable-row.p-highlight').length;
+                    if (n > 0) return n;
+                    // Chỉ đếm aria-checked trong tbody (loại trừ header)
+                    n = document.querySelectorAll('tbody [aria-checked="true"], tr[aria-checked="true"]').length;
+                    if (n > 0) return n;
+                    // Chỉ đếm p-checkbox-checked trong td (loại trừ th)
+                    n = document.querySelectorAll('td .p-checkbox-checked').length;
+                    if (n > 0) return n;
+                    n = document.querySelectorAll('td.col-checkbox svg').length;
+                    if (n > 0) return n;
+                    // Chỉ đếm checkbox đã check trong tbody
+                    return document.querySelectorAll('tbody input[type="checkbox"]:checked').length;
+                }""")
+                log_cb(f'  📋 Header checkbox đã chọn {header_checked}/{total_avail} đơn', 'info')
+
+                # ── Phân biệt Case 1 vs Case 2 dựa vào sự TỒN TẠI của nút "Chọn tất cả" ──
+                # Case 1: trang chỉ có đúng ≤20 đơn thật → KHÔNG có nút "Chọn tất cả"
+                #         → dùng luôn header_checked, không cần tìm nút.
+                # Case 2: trang đầy 20 đơn nhưng thực tế có >20 đơn → CÓ nút
+                #         "Chọn tất cả X đơn" hoặc "Chọn X đơn hàng đầu tiên"
+                #         → bấm nút đó để chọn toàn bộ đơn ở tất cả các trang.
+                #
+                # Quan trọng: phải kiểm tra sự tồn tại của nút TRƯỚC KHI quyết định.
+                # Nếu đoán sai (Case 1 mà vẫn cố tìm & bấm) → toggle off → mất hết checkbox.
+
+                # ── Tìm nút "Chọn tất cả" bằng selector cụ thể (không quét toàn bộ) ──
                 select_all_btn = None
-                for sel_text in ['Chọn tất cả', 'Select all', 'Chọn tất', 'Select All']:
-                    for tag in ['span', 'button', 'div']:
-                        try:
-                            btns = page.locator(f'{tag}:has-text("{sel_text}")')
-                            cnt = btns.count()
-                            for j in range(cnt):
-                                b = btns.nth(j)
-                                if b.is_visible(timeout=800): select_all_btn = b; break
-                        except: pass
-                        if select_all_btn: break
-                    if select_all_btn: break
+                for sel in [
+                    'button:has-text("Chọn tất cả")',
+                    'button:has-text("Chọn")',
+                    'button:has-text("Select all")',
+                    'button:has-text("Select")',
+                ]:
+                    try:
+                        candidates = page.locator(sel).all()
+                        for b in candidates:
+                            try:
+                                txt = b.inner_text().strip().lower()
+                                if (('chọn' in txt or 'select' in txt)
+                                        and ('đơn' in txt or 'order' in txt)):
+                                    if b.is_visible():
+                                        select_all_btn = b
+                                        break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if select_all_btn:
+                        break
 
                 if select_all_btn:
+                    # ✅ Case 2: Tìm thấy nút "Chọn tất cả" → có >20 đơn
+                    btn_text = select_all_btn.inner_text().strip()[:60]
                     select_all_btn.click(timeout=5000)
-                    log_cb(f'  ✅ Đã bấm "Chọn tất cả"', 'ok')
-                    page.wait_for_timeout(2000)
-                    checked = page.evaluate("() => document.querySelectorAll('input[type=\"checkbox\"]:checked').length")
+                    log_cb(f'  ✅ Đã bấm "{btn_text}"', 'ok')
+                    page.wait_for_timeout(3000)
+                    checked = page.evaluate("""() => {
+                        let n = document.querySelectorAll('tr.p-highlight, tr.p-selectable-row.p-highlight').length;
+                        if (n > 0) return n;
+                        n = document.querySelectorAll('tbody [aria-checked="true"], tr[aria-checked="true"]').length;
+                        if (n > 0) return n;
+                        n = document.querySelectorAll('td .p-checkbox-checked').length;
+                        if (n > 0) return n;
+                        n = document.querySelectorAll('td.col-checkbox svg').length;
+                        if (n > 0) return n;
+                        const bar = document.querySelector('[class*="selected"], [class*="Selected"], [class*="count"]');
+                        if (bar) {
+                            const m = bar.textContent.match(/(\\d+)\\s*đơn/);
+                            if (m) return parseInt(m[1]);
+                        }
+                        return document.querySelectorAll('tbody input[type="checkbox"]:checked').length;
+                    }""")
                     log_cb(f'  ✓ Đã chọn {checked} đơn hàng', 'ok')
-                else:
-                    # Không có nút "Chọn tất cả" → có thể header checkbox đã chọn hết rồi (≤50 đơn)
-                    already_checked = page.evaluate("() => document.querySelectorAll('input[type=\"checkbox\"]:checked').length")
-                    if already_checked > 0:
-                        checked = already_checked
-                        log_cb(f'  ✓ Header checkbox đã chọn {checked} đơn (không cần nút "Chọn tất cả")', 'ok')
-                    else:
-                        log_cb('  ⚠ Không tìm thấy nút "Chọn tất cả" — fallback tick tay', 'warn')
-                        to_select = min(batch_target, total_avail)
-                        cbs = page.query_selector_all('td.col-checkbox label.p-checkbox')
-                        checked = 0
-                        for cb in cbs[:to_select]:
-                            try: cb.click(); checked += 1; page.wait_for_timeout(120)
+                    if checked < header_checked:
+                        log_cb(f'  ⚠ "Chọn tất cả" đã toggle off ({header_checked}→{checked}) — chọn lại bằng header checkbox...', 'warn')
+                        for hdr_sel in ['th .p-checkbox', 'th.col-checkbox .p-checkbox', 'th input[type="checkbox"]']:
+                            try:
+                                hdr = page.locator(hdr_sel).first
+                                if hdr.count() > 0 and hdr.is_visible(timeout=1000):
+                                    hdr.click()
+                                    page.wait_for_timeout(2000)
+                                    break
                             except: pass
-                        page.wait_for_timeout(800)
-                        log_cb(f'  ✓ Đã tick {checked}/{to_select} đơn (fallback)', 'ok')
-                force_stop = True
+                        checked = header_checked
+                        log_cb(f'  ✓ Đã chọn lại {checked} đơn hàng', 'ok')
+
+                    # ── Phân biệt 2 loại nút để quyết định có chạy batch tiếp không ──
+                    btn_text_lower = btn_text.lower()
+                    if ('tất cả' in btn_text_lower or 'select all' in btn_text_lower):
+                        force_stop = True
+                        log_cb(f'  🏁 Nút "Chọn tất cả" → đã chọn hết đơn, batch này là cuối cùng', 'dim')
+                    elif ('đầu tiên' in btn_text_lower or 'first' in btn_text_lower):
+                        force_stop = False
+                        log_cb(f'  🔄 Nút "Chọn X đầu tiên" → còn đơn phía sau, sẽ chạy batch tiếp theo', 'info')
+                    else:
+                        force_stop = True
+                        log_cb(f'  ⚠ Không xác định được loại nút → dừng sau batch này để an toàn', 'warn')
+                    select_all_batches += 1
+                else:
+                    # ✅ Case 1: KHÔNG có nút "Chọn tất cả" → chỉ có đúng ≤20 đơn thật
+                    checked = header_checked
+                    log_cb(f'  ✓ Chỉ có {checked} đơn trên trang — không có nút "Chọn tất cả" (Case 1)', 'ok')
+                    force_stop = True
                 batch_target = 10**9
             else:
                 to_select = min(batch_target, total_avail)
@@ -287,6 +433,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 total_printed += checked; log_cb(f'  📊 Đã chọn {checked} đơn (test mode — không in)', 'info'); break
 
             state_cb('printing', f'Batch {batch_num}: Đang in...')
+            page.wait_for_timeout(2000)  # Đợi TikTok UI phản ứng sau khi chọn đơn
             ship_btn = None
             for btn_text in ['Sắp xếp vận chuyển và in', 'Arrange shipment and print', 'Sắp xếp vận chuyển']:
                 try:
@@ -301,6 +448,35 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         if 'vận chuyển' in txt and 'in' in txt: ship_btn = b; break
                     except: pass
             if not ship_btn:
+                # Fallback: có thể checkbox chưa thực sự được tick (false positive từ đếm JS)
+                # Thử tick tay từng checkbox rồi tìm lại nút
+                log_cb('  ⚠ Không tìm thấy nút — thử tick tay từng checkbox...', 'warn')
+                cbs = page.query_selector_all('td.col-checkbox label.p-checkbox')
+                retry_checked = 0
+                for cb in cbs:
+                    try:
+                        cb.click()
+                        retry_checked += 1
+                        page.wait_for_timeout(100)
+                    except: pass
+                page.wait_for_timeout(1500)
+                # Tìm lại ship button
+                for btn_text in ['Sắp xếp vận chuyển và in', 'Arrange shipment and print', 'Sắp xếp vận chuyển']:
+                    try:
+                        btn = page.locator(f'button:has-text("{btn_text}")').first
+                        if btn.count() > 0 and btn.is_visible(timeout=2000): ship_btn = btn; break
+                    except: pass
+                if not ship_btn:
+                    all_btns = page.locator('button').all()
+                    for b in all_btns:
+                        try:
+                            txt = b.inner_text().strip().lower()
+                            if 'vận chuyển' in txt and 'in' in txt: ship_btn = b; break
+                        except: pass
+                if ship_btn:
+                    checked = retry_checked
+                    log_cb(f'  ✓ Đã tick tay {checked} đơn và tìm thấy nút', 'ok')
+            if not ship_btn:
                 log_cb('  ✗ KHÔNG TÌM THẤY nút "Sắp xếp vận chuyển và in"!', 'err')
                 try:
                     ss = str(Path(output_dir) / f'debug_no_ship_btn_batch{batch_num}.png')
@@ -309,7 +485,34 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 total_printed += checked; break
             ship_btn.click()
             log_cb('  ✓ Đã bấm "Sắp xếp vận chuyển và in"', 'ok')
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
+
+            # ── Popup "cùng địa chỉ" (TikTok mới thêm) ──
+            # Nếu có đơn cùng địa chỉ → popup hỏi gộp đơn.
+            # Phải chọn "Tiếp tục mà không kết hợp" trước khi tới bước "Tiếp theo".
+            state_cb('printing', f'Batch {batch_num}: Kiểm tra popup "cùng địa chỉ"...')
+            khong_ket_hop_btn = None
+            for _ in range(15):
+                for sel_text in ['Tiếp tục mà không kết hợp', 'Continue without combining',
+                                 'Không kết hợp', 'Do not combine',
+                                 'Tiếp tục', 'Continue']:
+                    try:
+                        btn = page.locator(f'button:has-text("{sel_text}")').first
+                        if btn.count() > 0 and btn.is_visible(timeout=500):
+                            khong_ket_hop_btn = btn
+                            break
+                    except Exception:
+                        pass
+                if khong_ket_hop_btn:
+                    break
+                page.wait_for_timeout(1000)
+
+            if khong_ket_hop_btn:
+                khong_ket_hop_btn.click(timeout=5000)
+                log_cb('  ✓ Đã bấm "Tiếp tục mà không kết hợp" (popup cùng địa chỉ)', 'ok')
+                page.wait_for_timeout(3000)
+            else:
+                log_cb('  ℹ Không có popup cùng địa chỉ — tiếp tục...', 'dim')
 
             state_cb('printing', f'Batch {batch_num}: Đợi popup "Tiếp theo"...')
             tieptheo_btn = None
@@ -329,20 +532,20 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             if tieptheo_btn:
                 tieptheo_btn.click(timeout=5000)
                 log_cb('  ✓ Đã bấm "Tiếp theo"', 'ok')
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
 
                 state_cb('printing', f'Batch {batch_num}: Chọn loại chứng từ...')
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(3000)
                 for doc_label in ['Danh sách đóng gói', 'Danh sách lấy hàng']:
                     try:
                         lbl = page.locator('label').filter(has_text=doc_label).first
                         if lbl.count() > 0:
                             inp = lbl.locator('input')
                             if inp.count() > 0 and not inp.is_checked():
-                                lbl.click(); page.wait_for_timeout(300)
+                                lbl.click(); page.wait_for_timeout(500)
                                 log_cb(f'  ✓ Đã tick: {doc_label}', 'ok')
                     except: pass
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(2000)
 
                 in_btn = None
                 for btn_text in ['In nhãn ngay sau khi vận chuyển', 'In nhãn ngay', 'Print label immediately']:
@@ -386,38 +589,84 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 total_printed += checked; break
 
             log_cb('  📥 Đang bấm nút tải xuống...', 'info')
-            downloaded_files = []
-            def on_download(dl):
-                carrier_prefix = carrier.replace(' ', '_').replace('&', 'n') + '_' if carrier else ''
-                base_name = dl.suggested_filename or f'PDF_goc_TTS_batch{batch_num}_{len(downloaded_files)}_{datetime.now().strftime("%m-%d_%H-%M-%S")}.pdf'
-                suggested = carrier_prefix + base_name if carrier else base_name
-                bp = str(Path(output_dir) / suggested)
-                dl.save_as(bp)
-                downloaded_files.append(bp)
-                log_cb(f'  💾 Đã tải: {Path(bp).name}', 'ok')
-            
-            page.on('download', on_download)
-            taixuong_btn.click(timeout=5000)
-            log_cb('  ✓ Đã bấm "Tải xuống tất cả"', 'ok')
-            # Chờ download hoàn tất: tối đa 5 phút, nhưng nếu có file + 20s ko có thêm → xong
-            idle_ticks = 0
-            for _ in range(30):  # 30 × 10s = 5 phút tối đa
-                page.wait_for_timeout(10000)  # đợi 10 giây
-                if downloaded_files:
-                    prev_count = len(downloaded_files)
-                    page.wait_for_timeout(3000)  # đợi thêm 3s cho các download khác
-                    if len(downloaded_files) == prev_count:
-                        idle_ticks += 1
-                        if idle_ticks >= 2:  # 26 giây không có download mới → xong
-                            log_cb(f'  ✅ Download hoàn tất ({len(downloaded_files)} file)', 'ok')
-                            break
+
+            # ── Download với retry (tối đa 3 lần) ──
+            MAX_DOWNLOAD_RETRIES = 3
+            download_ok = False
+            for retry_attempt in range(MAX_DOWNLOAD_RETRIES):
+                if retry_attempt > 0:
+                    log_cb(f'  🔄 Retry download lần {retry_attempt+1}/{MAX_DOWNLOAD_RETRIES}...', 'warn')
+                    page.wait_for_timeout(3000)
+                    # Thử click lại nút tải xuống nếu popup còn hiển thị
+                    retry_btn = None
+                    for sel in ['button:has-text("Tải xuống tất cả")', 'button:has-text("Download all")',
+                                'button:has-text("Tải xuống")']:
+                        try:
+                            btn = page.locator(sel).first
+                            if btn.count() > 0 and btn.is_visible(timeout=2000):
+                                retry_btn = btn; break
+                        except: pass
+                    if retry_btn:
+                        retry_btn.click(timeout=5000)
+                        log_cb('  ✓ Đã click lại "Tải xuống tất cả"', 'ok')
                     else:
-                        idle_ticks = 0  # reset, vẫn còn download mới
-            page.remove_listener('download', on_download)
-            pdf_files.extend(downloaded_files)
-            log_cb(f'  📥 Tổng cộng {len(downloaded_files)} file đã tải', 'info')
-            if not downloaded_files:
-                log_cb('  ✗ Không bắt được download nào!', 'err')
+                        log_cb('  ⚠ Popup tải xuống đã biến mất — không thể retry', 'warn')
+                        break
+
+                downloaded_files = []
+                def on_download(dl):
+                    carrier_prefix = carrier.replace(' ', '_').replace('&', 'n') + '_' if carrier else ''
+                    base_name = dl.suggested_filename or f'PDF_goc_TTS_batch{batch_num}_{len(downloaded_files)}_{datetime.now().strftime("%m-%d_%H-%M-%S")}.pdf'
+                    suggested = carrier_prefix + base_name if carrier else base_name
+                    bp = str(Path(output_dir) / suggested)
+                    try:
+                        dl.save_as(bp)
+                        downloaded_files.append(bp)
+                        log_cb(f'  💾 Đã tải: {Path(bp).name}', 'ok')
+                    except Exception as save_err:
+                        log_cb(f'  ⚠ Lỗi lưu file: {save_err}', 'warn')
+
+                page.on('download', on_download)
+                if retry_attempt == 0:
+                    taixuong_btn.click(timeout=5000)
+                    log_cb('  ✓ Đã bấm "Tải xuống tất cả"', 'ok')
+                # Chờ download hoàn tất: tối đa 3 phút mỗi lần retry
+                idle_ticks = 0
+                for _ in range(18):  # 18 × 10s = 3 phút tối đa
+                    page.wait_for_timeout(10000)
+                    if downloaded_files:
+                        prev_count = len(downloaded_files)
+                        page.wait_for_timeout(3000)
+                        if len(downloaded_files) == prev_count:
+                            idle_ticks += 1
+                            if idle_ticks >= 2:  # 26 giây không có download mới → xong
+                                log_cb(f'  ✅ Download hoàn tất ({len(downloaded_files)} file)', 'ok')
+                                break
+                        else:
+                            idle_ticks = 0  # reset, vẫn còn download mới
+                page.remove_listener('download', on_download)
+
+                # ── VALIDATE file đã tải ──
+                valid_files = []
+                for f in downloaded_files:
+                    try:
+                        if Path(f).exists() and Path(f).stat().st_size > 0:
+                            valid_files.append(f)
+                        else:
+                            log_cb(f'  ⚠ File lỗi (0 bytes hoặc thiếu): {Path(f).name}', 'warn')
+                    except Exception as ve:
+                        log_cb(f'  ⚠ Không kiểm tra được file: {Path(f).name} - {ve}', 'warn')
+
+                if valid_files:
+                    pdf_files.extend(valid_files)
+                    log_cb(f'  📥 Đã tải {len(valid_files)} file hợp lệ', 'info')
+                    download_ok = True
+                    break
+                else:
+                    log_cb(f'  ⚠ Không có file hợp lệ trong lần tải này', 'warn')
+
+            if not download_ok:
+                log_cb('  ✗ Download thất bại sau các lần retry — bỏ qua batch này', 'err')
                 total_printed += checked; break
 
             total_printed += checked
@@ -425,6 +674,8 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 
             if force_stop:
                 log_cb('  ✓ Đã in hết đơn hiện có — hoàn thành.', 'ok'); break
+            if checked < 20:
+                log_cb(f'  ✓ Batch này chỉ có {checked} đơn (< 20) — hoàn thành.', 'ok'); break
             if total_printed < target and total_avail > 0:
                 page.wait_for_timeout(2000)
 
@@ -436,15 +687,16 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 # ============================================================
 # CALCULATOR
 # ============================================================
-def run_calculator(pdf_paths, output_dir, master_path, retail_path, log_cb, carrier=''):
+def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_path, log_cb, carrier=''):
     if process_all is None:
         log_cb('✗ Calculator không khả dụng (thiếu module calculator)', 'err'); return []
     if not Path(master_path).exists(): log_cb(f'✗ Không tìm thấy master_data: {master_path}', 'err'); return []
+    if not Path(template_path).exists(): log_cb(f'✗ Không tìm thấy template: {template_path}', 'err'); return []
     out_dir = str(output_dir)
     for p in pdf_paths:
         shutil.copy2(p, str(UPLOAD_DIR / Path(p).name))
     try:
-        results = process_all(pdf_paths, out_dir, master_path, retail_path, carrier)
+        results = process_all(pdf_paths, out_dir, master_path, retail_path, carrier, template_path=template_path)
         for r in results:
             log_cb(f'  ✓ {r["rows"]} dòng | Qty={r["tong_qty"]} | Sold={r["tong_sold"]} | Promo={r["tong_promo"]}', 'ok')
             for key, fb in r['files'].items():
@@ -471,33 +723,53 @@ class AutomationWorker(QObject):
 
     @Slot(dict)
     def start_job(self, config: dict):
+        # ── Dọn dẹp browser cũ từ job trước (nếu có) ──
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            import time as _time_cleanup
+            _time_cleanup.sleep(0.3)
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
         self._running = True
         self._stop_event.clear()
-        # Tái sử dụng browser từ lần chạy trước (giữ session, tránh logout)
-        pw = self._playwright
-        br = self._browser
+
         all_pdf_paths = []
         all_results = []
 
+        pw = None
+        br = None
+
         try:
             cookie = config['cookie']
-            base_dir = config['output_dir']
+            out_dir = config['output_dir']  # Đã có sẵn date subfolder từ main thread
             master = config['master']
             retail = config['retail']
+            template = config['template']
             auto_print = config['auto_print']
             printer = config['printer']
             test_mode = config['test_mode']
+            exclude_pre_orders = config.get('exclude_pre_orders', True)
             batch_size = config.get('batch_size', 15)
             pdf_settings = config.get('pdf_settings', 'paper=A4')
             carriers = config['carriers']
 
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            out_dir = str(Path(base_dir) / today_str)
             os.makedirs(out_dir, exist_ok=True)
 
             for carrier, count in carriers:
+                # ── Skip completed carriers khi resume ──
                 if self._stop_event.is_set():
-                    self.log_message.emit('warn', 'Đã dừng theo yêu cầu.'); break
+                    self.log_message.emit('warn', 'Đã dừng theo yêu cầu.');
+                    break
+
                 carrier_display = carrier if carrier else 'tất cả'
                 count_display = f'{count}' if count > 0 else 'tất cả'
                 self.log_message.emit('info', f'📥 Tải PDF [{carrier_display}] ({count_display} đơn)...')
@@ -508,7 +780,8 @@ class AutomationWorker(QObject):
                     lambda s, m: self.state_changed.emit(s, m),
                     self._stop_event,
                     existing_playwright=pw, existing_browser=br,
-                    carrier=carrier, test_mode=test_mode)
+                    carrier=carrier, test_mode=test_mode,
+                    exclude_pre_orders=exclude_pre_orders)
 
                 if pw2: pw = pw2
                 if br2: br = br2
@@ -523,7 +796,7 @@ class AutomationWorker(QObject):
                 tag = 'ok' if pdf_paths else 'warn'
                 self.log_message.emit(tag, f'📥 [{carrier_display}]: đã tải {len(pdf_paths)} file PDF')
 
-                # In shipping label TRƯỚC, rồi mới tính toán (giống Test)
+                # In shipping label TRƯỚC, rồi mới tính toán
                 if auto_print and pdf_paths:
                     self.log_message.emit('info', f'🖨️ [{carrier_display}]: In shipping label...')
                     for p in pdf_paths:
@@ -541,11 +814,11 @@ class AutomationWorker(QObject):
                 if pdf_paths:
                     self.log_message.emit('info', f'📊 Đang tính bill [{carrier_display}]...')
                     carrier_results = run_calculator(
-                        pdf_paths, out_dir, master, retail,
+                        pdf_paths, out_dir, master, retail, template,
                         lambda m, t='': self.log_message.emit(t, m),
                         carrier=carrier)
                     for r in carrier_results:
-                        for key, lbl in [('pdf_report', '📄')]:
+                        for key, lbl in [('xlsx_report', '📊')]:
                             fp = r['files'].get(key)
                             if fp and Path(fp).exists():
                                 self.log_message.emit('info', f'{lbl} {Path(fp).name}')
@@ -555,27 +828,46 @@ class AutomationWorker(QObject):
                 # In báo cáo sau khi tính toán
                 if auto_print and carrier_results:
                     for r in carrier_results:
-                        fp = r['files'].get('pdf_report')
+                        fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
                         if fp and Path(fp).exists():
                             try:
-                                _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                            log_cb=lambda m, t='': self.log_message.emit(t, m))
-                                self.log_message.emit('ok', f'  ✓ Đã in báo cáo: {Path(fp).name}')
+                                for copy_num in [1, 2]:
+                                    self.log_message.emit('info', f'  🖨️ In bản {copy_num}/2: {Path(fp).name}')
+                                    _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                                log_cb=lambda m, t='': self.log_message.emit(t, m))
+                                    if copy_num == 1:
+                                        import time as _t3; _t3.sleep(2)
+                                self.log_message.emit('ok', f'  ✓ Đã in báo cáo 2 bản: {Path(fp).name}')
                             except Exception as e:
                                 self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
 
+            # ── Tất cả carriers hoàn thành ──
             self.log_message.emit('bold_ok', '🏁 HOÀN THÀNH!')
             self.state_changed.emit('done', f'✅ Hoàn thành lúc {datetime.now().strftime("%H:%M:%S")}')
-            self._playwright = pw
-            self._browser = br
+            try:
+                if br: br.close()
+            except Exception: pass
+            try:
+                if pw: pw.stop()
+            except Exception: pass
+            self._playwright = None
+            self._browser = None
             self.job_completed.emit({
-                'playwright': pw, 'browser': br,
+                'playwright': None, 'browser': None,
                 'pdf_paths': all_pdf_paths, 'results': all_results,
                 'output_dir': out_dir,
             })
         except Exception as e:
             self.log_message.emit('err', f'✗ Lỗi: {e}')
             self.state_changed.emit('error', f'✗ {e}')
+            try:
+                if self._browser: self._browser.close()
+            except Exception: pass
+            try:
+                if self._playwright: self._playwright.stop()
+            except Exception: pass
+            self._playwright = None
+            self._browser = None
             self.job_completed.emit({})
         finally:
             self._running = False
@@ -593,18 +885,34 @@ class AutomationWorker(QObject):
             if self._playwright: self._playwright.stop()
         except: pass
 
-_warned_sumatra = False
-_custom_sumatra_path = ''  # Người dùng có thể chỉ định đường dẫn thủ công trong giao diện
+_foxit_exe_cache = None
 
 
-def _wait_print_queue(printer_name, max_jobs=0, timeout=600):
+def _find_foxit_exe():
+    """Tìm Foxit PDF Reader — dùng XPS Print Path, spool nhẹ ~15MB."""
+    global _foxit_exe_cache
+    if _foxit_exe_cache is not None:
+        return _foxit_exe_cache or ''
+    foxit_paths = [
+        r'C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
+        r'C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
+    ]
+    for fp in foxit_paths:
+        if Path(fp).exists():
+            _foxit_exe_cache = fp
+            return fp
+    _foxit_exe_cache = ''
+    return ''
+
+
+def _wait_print_queue(printer_name, max_jobs=2, timeout=600):
     """Đợi hàng đợi máy in ≤ max_jobs rồi mới gửi job mới (tránh quá tải RAM máy in)."""
     import subprocess as _sp, time as _t
     deadline = _t.time() + timeout
     while _t.time() < deadline:
         result = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
             f"@(Get-PrintJob -PrinterName '{printer_name}' -ErrorAction SilentlyContinue).Count"
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
         try:
             count = int(result.stdout.strip())
         except ValueError:
@@ -614,139 +922,105 @@ def _wait_print_queue(printer_name, max_jobs=0, timeout=600):
         _t.sleep(1)  # kiểm tra mỗi 1 giây
 
 
-def _ensure_sumatra_settings():
-    """Tạo/ghi đè file cài đặt SumatraPDF để tắt Welcome page."""
-    try:
-        settings_dir = Path(os.environ.get('APPDATA', '')) / 'SumatraPDF'
-        settings_file = settings_dir / 'SumatraPDF-settings.txt'
-        settings_dir.mkdir(parents=True, exist_ok=True)
-        # Đọc nội dung cũ (nếu có), chỉ ghi đè dòng ShowStartPage
-        content = ''
-        if settings_file.exists():
-            content = settings_file.read_text()
-        # Luôn đảm bảo ShowStartPage = false
-        if 'ShowStartPage' in content:
-            content = _re.sub(r'^ShowStartPage\s*=.*$', 'ShowStartPage = false', content, flags=_re.MULTILINE)
-        else:
-            content = content.rstrip('\n') + '\nShowStartPage = false\n'
-        if 'RememberOpenedFiles' not in content:
-            content = content.rstrip('\n') + '\nRememberOpenedFiles = false\n'
-        settings_file.write_text(content)
-    except Exception:
-        pass  # Không ảnh hưởng đến luồng in chính
-
 def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=15):
     import subprocess, os as _os
     fp = str(file_path)
-    if fp.lower().endswith('.pdf'):
-        sumatra_exe = None
-        # Ưu tiên: 0) Đường dẫn tùy chỉnh từ giao diện  1) Cạnh exe  2) %LOCALAPPDATA%  3) Program Files
-        sumatra_paths = []
-        if _custom_sumatra_path and Path(_custom_sumatra_path).exists():
-            sumatra_paths.append(_custom_sumatra_path)
-        sumatra_paths += [
-            _os.path.join(_os.path.dirname(sys.executable), 'SumatraPDF.exe'),
-            _os.path.join(_os.environ.get('LOCALAPPDATA', ''), 'SumatraPDF', 'SumatraPDF.exe'),
-            r'C:\Program Files\SumatraPDF\SumatraPDF.exe',
-            r'C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe',
-        ]
-        for sp in sumatra_paths:
-            if Path(sp).exists(): sumatra_exe = sp; break
-        print_path = fp
-        temp_merged = None
-        # Chỉ merge 2-up file shipping label, không merge file báo cáo
-        fname_lower = Path(fp).name.lower()
-        if 'shipping' in fname_lower or 'vận chuyển' in fname_lower:
-            try:
-                temp_merged = _merge_pdf_2up(fp)
-                if temp_merged: print_path = temp_merged
-            except: pass
 
-        if sumatra_exe:
-            _ensure_sumatra_settings()
-            # Chia batch nếu file > batch_size tờ (tránh máy in hết RAM)
-            try:
-                from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
-                reader = _PdfReader(print_path)
-                total_pages = len(reader.pages)
-            except Exception:
-                reader = None
-                total_pages = 0
+    try:
+        if fp.lower().endswith('.pdf'):
+            foxit_exe = _find_foxit_exe()
+            if not foxit_exe:
+                raise RuntimeError(
+                    'Không tìm thấy Foxit PDF Reader. '
+                    'Vui lòng cài Foxit PDF Reader để in file PDF.'
+                )
 
-            if reader and total_pages > batch_size:
-                total_batches = (total_pages + batch_size - 1) // batch_size
-                if log_cb: log_cb(f'  📦 Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
-                batch_num = 0
-                for start in range(0, total_pages, batch_size):
-                    batch_num += 1
-                    end = min(start + batch_size, total_pages)
-                    if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
-                    batch_writer = _PdfWriter()
-                    for i in range(start, end):
-                        batch_writer.add_page(reader.pages[i])
-                    batch_path = print_path + f'.batch{batch_num}.pdf'
-                    with open(batch_path, 'wb') as bf:
-                        batch_writer.write(bf)
+            print_path = fp
+            temp_merged = None
+            # Chỉ merge 2-up file shipping label, không merge file báo cáo
+            fname_lower = Path(fp).name.lower()
+            if 'shipping' in fname_lower or 'vận chuyển' in fname_lower:
+                try:
+                    temp_merged = _merge_pdf_2up(fp)
+                    if temp_merged: print_path = temp_merged
+                except: pass
 
-                    # Đợi queue trống rồi gửi batch tiếp (in liền mạch, không ngắt quãng)
-                    _wait_print_queue(printer_name, max_jobs=0)
+            if foxit_exe:
+                # ── Đọc số trang để quyết định batch splitting ──
+                try:
+                    from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
+                    reader = _PdfReader(print_path)
+                    total_pages = len(reader.pages)
+                except Exception:
+                    reader = None
+                    total_pages = 0
 
-                    cmd = [sumatra_exe, '-print-to', printer_name, '-exit-when-done', batch_path]
-                    if pdf_settings:
-                        cmd += ['-print-settings', pdf_settings]
+                # ── Batch splitting ──
+                if reader and total_pages > batch_size:
+                    total_batches = (total_pages + batch_size - 1) // batch_size
+                    if log_cb: log_cb(f'  📦 Foxit: Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
+                    batch_num = 0
+                    for start in range(0, total_pages, batch_size):
+                        batch_num += 1
+                        end = min(start + batch_size, total_pages)
+                        if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
+                        batch_writer = _PdfWriter()
+                        for i in range(start, end):
+                            batch_writer.add_page(reader.pages[i])
+                        batch_path = print_path + f'.batch{batch_num}.pdf'
+                        with open(batch_path, 'wb') as bf:
+                            batch_writer.write(bf)
+
+                        _wait_print_queue(printer_name, max_jobs=2)
+                        cmd = [foxit_exe, '/t', batch_path, printer_name]
+                        result = subprocess.run(cmd, check=False, timeout=600)
+                        if result.returncode != 0:
+                            raise RuntimeError(f'Foxit batch {batch_num} exit code: {result.returncode}')
+
+                        try: _os.remove(batch_path)
+                        except: pass
+
+                    _wait_print_queue(printer_name)
+                else:
+                    # ── In thẳng không batch ──
+                    _wait_print_queue(printer_name)
+                    cmd = [foxit_exe, '/t', print_path, printer_name]
                     result = subprocess.run(cmd, check=False, timeout=600)
                     if result.returncode != 0:
-                        raise RuntimeError(f'SumatraPDF batch {batch_num} exit code: {result.returncode}')
-
-                    # Dọn file batch tạm
-                    try: _os.remove(batch_path)
+                        raise RuntimeError(f'Foxit exit code: {result.returncode}')
+            if temp_merged:
+                def _cleanup(p=temp_merged):
+                    import time; time.sleep(5)
+                    try: _os.remove(p)
                     except: pass
-
-                # Đợi batch cuối in xong
-                _wait_print_queue(printer_name)
-            else:
-                _wait_print_queue(printer_name)
-                cmd = [sumatra_exe, '-print-to', printer_name, '-exit-when-done', print_path]
-                if pdf_settings: cmd += ['-print-settings', pdf_settings]
-                result = subprocess.run(cmd, check=False, timeout=600)
-                if result.returncode != 0:
-                    raise RuntimeError(f'SumatraPDF exit code: {result.returncode}')
-        else:
-            global _warned_sumatra
-            if not _warned_sumatra:
-                _warned_sumatra = True
-                # Log rõ ràng để user biết cần cài SumatraPDF
-                print(f'[TTS_Bill] ⚠ Không tìm thấy SumatraPDF.exe. '
-                      f'Đặt file vào thư mục chứa TTS_Bill.exe hoặc cài tại C:\\Program Files\\SumatraPDF.')
-            raise RuntimeError(
-                'Không tìm thấy SumatraPDF.exe. '
-                'Đặt SumatraPDF.exe vào thư mục portable hoặc cài đặt SumatraPDF.'
-            )
-        if temp_merged:
-            def _cleanup(p=temp_merged):
-                import time; time.sleep(5)
-                try: _os.remove(p)
-                except: pass
-            threading.Timer(5, _cleanup).start()
-        return
-
-    if fp.lower().endswith('.xlsx') or fp.lower().endswith('.xls'):
-        try:
-            import pythoncom, win32com.client
-            pythoncom.CoInitialize()
-            excel = win32com.client.Dispatch("Excel.Application")
-            excel.Visible = False
-            workbook = excel.Workbooks.Open(_os.path.abspath(fp))
-            workbook.PrintOut(ActivePrinter=printer_name)
-            workbook.Close(False); excel.Quit(); pythoncom.CoUninitialize()
+                threading.Timer(5, _cleanup).start()
             return
-        except Exception:
-            try: pythoncom.CoUninitialize()
-            except: pass
-        # Nếu COM thất bại (không có Excel) → báo lỗi rõ ràng
-        raise RuntimeError(
-            'Không thể in file Excel. Máy cần cài Microsoft Excel.'
-        )
+
+        if fp.lower().endswith('.xlsx') or fp.lower().endswith('.xls'):
+            try:
+                import pythoncom, win32com.client, time as _t_excel
+                # Đợi queue trống + delay cứng để đảm bảo 2 job không bị gộp
+                _wait_print_queue(printer_name)
+                _t_excel.sleep(1)
+                pythoncom.CoInitialize()
+                excel = win32com.client.Dispatch("Excel.Application")
+                excel.Visible = False
+                workbook = excel.Workbooks.Open(_os.path.abspath(fp))
+                workbook.PrintOut(ActivePrinter=printer_name, FitToPagesWide=1, FitToPagesTall=False)
+                # Đợi Excel spool xong job ra queue rồi mới đóng
+                _t_excel.sleep(2)
+                workbook.Close(False); excel.Quit(); pythoncom.CoUninitialize()
+                # Đợi job đã chắc chắn vào queue
+                _t_excel.sleep(1)
+                return
+            except Exception:
+                try: pythoncom.CoUninitialize()
+                except: pass
+            raise RuntimeError(
+                'Không thể in file Excel. Máy cần cài Microsoft Excel.'
+            )
+    except Exception:
+        raise
 
 def _merge_pdf_2up(pdf_path):
     import os as _os
@@ -754,12 +1028,13 @@ def _merge_pdf_2up(pdf_path):
     except ImportError: return None
     try:
         reader = PdfReader(pdf_path)
-        if len(reader.pages) < 2: return None
+        if len(reader.pages) < 1: return None
         canvas_w, canvas_h = 842, 595
-        margin_left, margin_top, gap, scale_factor = 14, 28, -14, 0.70
+        margin_left, margin_top, gap, scale_factor = 0, 28, -14, 0.70
         writer = PdfWriter()
         avail_w = canvas_w - 2*margin_left - gap
         half_w = avail_w / 2
+        # Nếu lẻ 1 trang → vẫn merge 1 mình lên A4 ngang để scale nhỏ, tránh bị to nguyên tờ
         for pair_start in range(0, len(reader.pages), 2):
             pair = reader.pages[pair_start:pair_start+2]
             canvas = PageObject.create_blank_page(width=canvas_w, height=canvas_h)
@@ -932,6 +1207,10 @@ class App(QMainWindow):
         if local_retail.exists(): self._retail_real = str(local_retail)
         elif RETAIL_DEFAULT.exists(): self._retail_real = str(RETAIL_DEFAULT)
         else: self._retail_real = ""
+        local_template = BASE_DIR / "Bảng thống kê hàng.xlsx"
+        if local_template.exists(): self._template_real = str(local_template)
+        elif TEMPLATE_DEFAULT.exists(): self._template_real = str(TEMPLATE_DEFAULT)
+        else: self._template_real = ""
 
         self.running = False
         self.scheduler_active = False
@@ -940,9 +1219,16 @@ class App(QMainWindow):
 
         self._sched_mode = "once"
         self._sched_interval_hours = 1
-        self._sched_daily_times = []
+        self._sched_weekly_config: dict[int, list[tuple[int, int]]] = {}  # 0=Thứ 2..6=Chủ Nhật
         self._sched_next_run = None
         self._sched_last_run = None
+
+        # Weekly scheduler widget refs (assigned in _build_schedule_tab)
+        self.weekly_rb = None
+        self.weekly_panel = None
+        self.weekly_day_checkboxes: dict[int, QCheckBox] = {}
+        self.weekly_day_time_edits: dict[int, QLineEdit] = {}
+        self.weekly_master_time_edit = None
 
         self._worker_thread = QThread()
         self._worker = AutomationWorker()
@@ -962,13 +1248,14 @@ class App(QMainWindow):
         self._apply_stylesheet()
         self._build_ui()
 
-        # Set global SumatraPDF path nếu đã detect được
-        if self.sumatra_path_edit.text():
-            self._on_sumatra_path_changed(self.sumatra_path_edit.text())
+        # ── Nạp cấu hình đã lưu từ lần trước ──
+        self._config_path = BASE_DIR / '.tts_config.json'
+        self._load_config()
 
         self._update_cookie_status()
         self._update_master_status()
         self._update_retail_status()
+        self._update_template_status()
         out_dir = self.output_row.get_real_path()
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -1096,6 +1383,7 @@ class App(QMainWindow):
         self.content_stack.addWidget(self._build_schedule_tab())
         self.content_stack.addWidget(self._build_log_tab())
         self.content_stack.addWidget(self._build_test_tab())
+        self.content_stack.addWidget(self._build_aggregate_tab())
         main_layout.addWidget(self.content_stack, 1)
 
         main_layout.addWidget(self._build_bottom_bar())
@@ -1135,6 +1423,7 @@ class App(QMainWindow):
             "⏰ Lịch trình",
             "📋 Nhật ký & Kết quả",
             "🧪 Test",
+            "📊 Tổng hợp",
         ]
 
         for i, label in enumerate(tab_labels):
@@ -1197,6 +1486,11 @@ class App(QMainWindow):
         self.retail_row.set_path(self._retail_real)
         self.retail_row.path_changed.connect(self._on_retail_changed)
         gb1_layout.addWidget(self.retail_row)
+
+        self.template_row = FileRowWidget("📋 Mẫu xuất hàng", "Excel Files (*.xlsx)")
+        self.template_row.set_path(self._template_real)
+        self.template_row.path_changed.connect(self._on_template_changed)
+        gb1_layout.addWidget(self.template_row)
 
         self.output_row = FileRowWidget("📂 Thư mục lưu", is_dir=True)
         self.output_row.set_path(str(BASE_DIR / "outputs"))
@@ -1380,42 +1674,41 @@ class App(QMainWindow):
         paper_row.addStretch()
         gb_layout.addLayout(paper_row)
 
-        # ── SumatraPDF custom path row ──
-        sumatra_row = QHBoxLayout()
-        sumatra_row.setSpacing(8)
-        sumatra_row.setContentsMargins(0, 4, 0, 0)
-        sumatra_row.addWidget(QLabel("SumatraPDF:"))
+        # ── Engine in PDF: Foxit PDF Reader (XPS Print Path, spool ~15MB) ──
+        foxit_detected = _find_foxit_exe()
 
-        # Tự động dò tìm SumatraPDF
-        import os as _os_detect
-        _detected = ''
-        for _sp in [
-            _os_detect.path.join(_os_detect.path.dirname(sys.executable), 'SumatraPDF.exe'),
-            _os_detect.path.join(_os_detect.environ.get('LOCALAPPDATA', ''), 'SumatraPDF', 'SumatraPDF.exe'),
-            r'C:\Program Files\SumatraPDF\SumatraPDF.exe',
-            r'C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe',
-        ]:
-            if Path(_sp).exists():
-                _detected = _sp; break
+        # Label hiển thị engine in PDF
+        engine_label = QLabel("Engine in PDF:")
+        engine_label.setFixedWidth(130)
+        engine_label.setStyleSheet("font-weight: 600; color: #1E293B; font-size: 10pt;")
 
-        self.sumatra_path_edit = QLineEdit()
-        self.sumatra_path_edit.setPlaceholderText("Không tìm thấy — chọn thủ công...")
-        self.sumatra_path_edit.setMinimumWidth(280)
-        if _detected:
-            self.sumatra_path_edit.setText(_detected)
-            self.sumatra_path_edit.setStyleSheet("color: #059669;")  # xanh lá = đã tìm thấy
-        self.sumatra_path_edit.textChanged.connect(self._on_sumatra_path_changed)
-        sumatra_row.addWidget(self.sumatra_path_edit, 1)
-        browse_sumatra_btn = QPushButton("Duyệt...")
-        browse_sumatra_btn.setFixedWidth(70)
-        browse_sumatra_btn.setCursor(Qt.PointingHandCursor)
-        browse_sumatra_btn.clicked.connect(self._browse_sumatra_path)
-        sumatra_row.addWidget(browse_sumatra_btn)
-        gb_layout.addLayout(sumatra_row)
+        foxit_status = QLabel()
+        foxit_status.setWordWrap(True)
+        if foxit_detected:
+            foxit_status.setText("✅ Foxit PDF Reader — XPS Print Path (spool ~15MB)")
+            foxit_status.setStyleSheet("color: #059669; font-size: 9pt; padding: 2px 0;")
+        else:
+            foxit_status.setText("⚠ Chưa cài Foxit PDF Reader — Vui lòng cài để in file PDF!")
+            foxit_status.setStyleSheet("color: #DC2626; font-weight: 600; font-size: 10pt; padding: 2px 0;")
+
+        gb_layout.addWidget(engine_label)
+        gb_layout.addWidget(foxit_status)
+
+        # ── Chrome info ──
+        chrome_info = QLabel("🌐 Sử dụng Google Chrome có sẵn trên máy")
+        chrome_info.setStyleSheet("color: #059669; font-weight: 500; font-size: 13px; margin-top: 8px;")
+        gb_layout.addWidget(chrome_info)
+
+        # ── Loại trừ đơn bán trước ──
+        self.exclude_pre_orders_cb = QCheckBox("🚫 Loại trừ đơn bán trước (Pre-order) khi tải đơn")
+        self.exclude_pre_orders_cb.setChecked(False)
+        self.exclude_pre_orders_cb.setToolTip("Bỏ tick nếu bạn MUỐN in cả đơn bán trước.\nTick để bỏ qua đơn bán trước, chỉ in đơn thường.")
+        self.exclude_pre_orders_cb.setStyleSheet("color: #64748B; font-weight: 500; font-size: 13px; margin-top: 8px;")
+        gb_layout.addWidget(self.exclude_pre_orders_cb)
 
         # ── Test mode ──
         self.test_mode_cb = QCheckBox("🧪 Bật chế độ Test Mode (Chỉ tải danh sách đơn, KHÔNG thao tác in)")
-        self.test_mode_cb.setChecked(True)
+        self.test_mode_cb.setChecked(False)
         self.test_mode_cb.setStyleSheet("color: #D97706; font-weight: 600; font-size: 14px; margin-top: 12px;")
         gb_layout.addWidget(self.test_mode_cb)
 
@@ -1472,26 +1765,69 @@ class App(QMainWindow):
         self.interval_panel.hide()
         gb_layout.addWidget(self.interval_panel)
 
-        self.daily_rb = QRadioButton("🕒 Chạy vào các khung giờ cố định trong ngày")
-        self.daily_rb.setProperty("mode", "daily")
-        self.sched_button_group.addButton(self.daily_rb)
-        gb_layout.addWidget(self.daily_rb)
+        self.weekly_rb = QRadioButton("📅 Chạy theo lịch hàng tuần")
+        self.weekly_rb.setProperty("mode", "weekly")
+        self.sched_button_group.addButton(self.weekly_rb)
+        gb_layout.addWidget(self.weekly_rb)
 
-        # Daily sub-panel
-        self.daily_panel = QWidget()
-        dp_layout = QHBoxLayout(self.daily_panel)
-        dp_layout.setContentsMargins(32, 0, 0, 0)
-        dp_layout.setSpacing(8)
-        dp_layout.addWidget(QLabel("Khung giờ:"))
-        self.daily_times_edit = QLineEdit("08:00, 14:00, 20:00")
-        self.daily_times_edit.setFixedWidth(200)
-        dp_layout.addWidget(self.daily_times_edit)
-        hint = QLabel("(Ngăn cách bằng dấu phẩy)")
-        hint.setStyleSheet("color: #64748B; font-size: 13px;")
-        dp_layout.addWidget(hint)
-        dp_layout.addStretch()
-        self.daily_panel.hide()
-        gb_layout.addWidget(self.daily_panel)
+        # Weekly sub-panel — mỗi ngày trong tuần có checkbox + khung giờ riêng
+        self.weekly_panel = QWidget()
+        wp_outer = QVBoxLayout(self.weekly_panel)
+        wp_outer.setContentsMargins(32, 0, 0, 0)
+        wp_outer.setSpacing(8)
+
+        # Quick-fill row
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(8)
+        quick_row.addWidget(QLabel("Nhập giờ mẫu:"))
+        self.weekly_master_time_edit = QLineEdit("08:00, 14:00, 20:00")
+        self.weekly_master_time_edit.setFixedWidth(200)
+        self.weekly_master_time_edit.setToolTip("Định dạng HH:MM, phân cách bằng dấu phẩy")
+        quick_row.addWidget(self.weekly_master_time_edit)
+        quick_row.addWidget(QLabel("(phân cách bằng dấu phẩy)"))
+        apply_btn = QPushButton("Áp dụng cho tất cả")
+        apply_btn.setFixedWidth(160)
+        apply_btn.setCursor(Qt.PointingHandCursor)
+        apply_btn.clicked.connect(self._on_weekly_apply_all)
+        quick_row.addWidget(apply_btn)
+        quick_row.addStretch()
+        wp_outer.addLayout(quick_row)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #E2E8F0; max-height: 1px;")
+        wp_outer.addWidget(sep)
+
+        # 7 day rows in a vertical layout
+        day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
+        for idx, name in enumerate(day_names):
+            day_row = QHBoxLayout()
+            day_row.setSpacing(8)
+
+            cb = QCheckBox(name)
+            cb.setFixedWidth(90)
+            cb.setChecked(idx < 5)  # Mặc định T2-T6 checked, T7+CN unchecked
+            cb.setStyleSheet("font-weight: 500;")
+            self.weekly_day_checkboxes[idx] = cb
+
+            te = QLineEdit("08:00, 14:00, 20:00" if idx < 5 else "")
+            te.setFixedWidth(220)
+            te.setEnabled(idx < 5)
+            te.setPlaceholderText("VD: 08:00, 14:00")
+            self.weekly_day_time_edits[idx] = te
+
+            # Checkbox toggle -> enable/disable time edit
+            cb.toggled.connect(lambda checked, i=idx: self.weekly_day_time_edits[i].setEnabled(checked))
+
+            day_row.addWidget(cb)
+            day_row.addWidget(te)
+            day_row.addStretch()
+            wp_outer.addLayout(day_row)
+
+        wp_outer.addStretch()
+        self.weekly_panel.hide()
+        gb_layout.addWidget(self.weekly_panel)
 
         self.sched_button_group.buttonClicked.connect(self._on_schedule_mode_changed)
 
@@ -1697,19 +2033,23 @@ class App(QMainWindow):
             return
         master = self._master_real
         retail = self._retail_real
+        template = self._template_real
         if not master or not Path(master).exists():
             QMessageBox.critical(self, "Lỗi", "Chọn file Master (Combo) hợp lệ ở tab Tệp dữ liệu.")
+            return
+        if not template or not Path(template).exists():
+            QMessageBox.critical(self, "Lỗi", "Chọn file Mẫu xuất hàng hợp lệ ở tab Tệp dữ liệu.")
             return
         out_dir = self.output_row.get_real_path() or str(BASE_DIR / "outputs")
 
         def _run():
             self._test_log.emit("info", "🧪 TEST: Bắt đầu tính toán...")
             try:
-                results = run_calculator(pdfs, out_dir, master, retail,
+                results = run_calculator(pdfs, out_dir, master, retail, template,
                                          lambda m, t='': self._test_log.emit(t, m))
                 for r in results:
                     self._test_log.emit("ok", f"  ✓ {r['rows']} SKU | Qty={r['tong_qty']} | Sold={r['tong_sold']} | Promo={r['tong_promo']}")
-                    for key, lbl in [('pdf_report', '📄')]:
+                    for key, lbl in [('xlsx_report', '📊')]:
                         fp = r['files'].get(key)
                         if fp and Path(fp).exists():
                             self._add_result(fp, label=lbl)
@@ -1729,10 +2069,12 @@ class App(QMainWindow):
         if not printer:
             QMessageBox.warning(self, "Cảnh báo", "Chọn máy in ở tab Cấu hình In.")
             return
+        auto_print = self.auto_print_cb.isChecked()
         if not auto_print:
             QMessageBox.warning(self, "Cảnh báo", "Tick 'In tự động ra máy in' ở tab Cấu hình In.")
             return
         pdf_settings = self._build_pdf_settings()
+        batch_size = self.batch_size_spin.value()
 
         def _run():
             self._test_log.emit("info", f"🧪 TEST: In {len(files)} file...")
@@ -1762,11 +2104,6 @@ class App(QMainWindow):
             QMessageBox.warning(self, "Cảnh báo", "Chọn ít nhất 1 file PDF.")
             return
 
-        # Phân loại file khác
-        other = [f for f in all_files if 'picking' not in Path(f).name.lower()
-                 and 'shipping' not in Path(f).name.lower()
-                 and 'vận chuyển' not in Path(f).name.lower()]
-
         master = self._master_real
         retail = self._retail_real
         out_dir = str(Path(all_files[0]).parent) if all_files else self.output_row.get_real_path() or str(BASE_DIR / "outputs")
@@ -1791,10 +2128,13 @@ class App(QMainWindow):
                 carrier = carrier_map.get(prefix, prefix)
                 if carrier not in by_carrier:
                     by_carrier[carrier] = {'picking': [], 'shipping': []}
-                if 'picking' in fname.lower():
-                    by_carrier[carrier]['picking'].append(f)
-                elif 'shipping' in fname.lower() or 'vận chuyển' in fname.lower():
+                if 'shipping' in fname.lower() or 'vận chuyển' in fname.lower():
                     by_carrier[carrier]['shipping'].append(f)
+                else:
+                    # Tất cả file còn lại (picking + file không rõ loại)
+                    # đều cho vào picking để chạy qua calculator —
+                    # đồng bộ với main pipeline (truyền tất cả file vào calculator)
+                    by_carrier[carrier]['picking'].append(f)
 
             # Xử lý từng carrier: shipping → tính toán → báo cáo
             for carrier, groups in by_carrier.items():
@@ -1815,30 +2155,143 @@ class App(QMainWindow):
                 if groups['picking']:
                     self._test_log.emit("info", f"  📊 {len(groups['picking'])} Picking list → tính toán...")
                     try:
-                        results = run_calculator(groups['picking'], out_dir, master, retail,
+                        results = run_calculator(groups['picking'], out_dir, master, retail, self._template_real,
                                                  lambda m, t='': self._test_log.emit(t, m),
                                                  carrier=carrier)
                         for r in results:
                             self._test_log.emit("ok", f"  ✓ {r['rows']} SKU | Qty={r['tong_qty']}")
-                            fp = r['files'].get('pdf_report')
+                            fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
                             if fp and Path(fp).exists():
                                 self._add_result(fp)
                                 if do_print:
                                     try:
-                                        _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                                    log_cb=lambda m, t='': self._test_log.emit(t, m))
-                                        self._test_log.emit("ok", f"  🖨️ Báo cáo: {Path(fp).name}")
+                                        for copy_num in [1, 2]:
+                                            self._test_log.emit("info", f"  🖨️ In bản {copy_num}/2: {Path(fp).name}")
+                                            _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                                        log_cb=lambda m, t='': self._test_log.emit(t, m))
+                                            if copy_num == 1:
+                                                import time as _t3; _t3.sleep(2)
+                                        self._test_log.emit("ok", f"  🖨️ Báo cáo 2 bản: {Path(fp).name}")
                                     except Exception as e:
                                         self._test_log.emit("err", f"  ✗ Lỗi in báo cáo: {e}")
                     except Exception as e:
                         self._test_log.emit("err", f"  ✗ Lỗi tính toán [{carrier}]: {e}")
 
-            if other:
-                self._test_log.emit("warn", f"⚠ {len(other)} file không rõ loại, bỏ qua")
-
             self._test_log.emit("bold_ok", "✅ Hoàn tất toàn bộ")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # ═══════════════════════════════════════════════════════
+    # TAB 5: TỔNG HỢP BÁO CÁO
+    # ═══════════════════════════════════════════════════════
+    def _build_aggregate_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        w = QWidget()
+        w.setObjectName("scrollContent")
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        gb = QGroupBox("📊 Tổng hợp nhiều file báo cáo thành 1 file duy nhất")
+        gb_layout = QVBoxLayout(gb)
+        gb_layout.setSpacing(8)
+
+        # ── Description ──
+        desc = QLabel("Chọn các file Excel báo cáo (Phieu_xuat_hang_*.xlsx) để gộp lại.\n"
+                      "Dữ liệu sẽ được cộng dồn theo SKU từ tất cả các file.")
+        desc.setStyleSheet("color: #64748B; font-size: 12px; padding: 4px 0;")
+        desc.setWordWrap(True)
+        gb_layout.addWidget(desc)
+
+        # ── File list ──
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("📂 Thêm file báo cáo...")
+        btn_add.setObjectName("browseBtn")
+        btn_add.setCursor(Qt.PointingHandCursor)
+        btn_add.clicked.connect(self._aggregate_select_files)
+        btn_row.addWidget(btn_add)
+
+        btn_clear = QPushButton("🗑 Xóa danh sách")
+        btn_clear.setObjectName("smallBtn")
+        btn_clear.setCursor(Qt.PointingHandCursor)
+        btn_clear.clicked.connect(lambda: self._aggregate_file_list.clear())
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        gb_layout.addLayout(btn_row)
+
+        self._aggregate_file_list = QListWidget()
+        self._aggregate_file_list.setMaximumHeight(150)
+        self._aggregate_file_list.setObjectName("resultList")
+        gb_layout.addWidget(self._aggregate_file_list)
+
+        # ── Run button ──
+        self._aggregate_run_btn = QPushButton("▶ Tổng hợp")
+        self._aggregate_run_btn.setObjectName("schedBtn")
+        self._aggregate_run_btn.setCursor(Qt.PointingHandCursor)
+        self._aggregate_run_btn.clicked.connect(self._on_run_aggregate)
+        gb_layout.addWidget(self._aggregate_run_btn)
+
+        # ── Aggregate log ──
+        self._aggregate_log = QTextEdit()
+        self._aggregate_log.setObjectName("logView")
+        self._aggregate_log.setReadOnly(True)
+        self._aggregate_log.setMaximumHeight(250)
+        gb_layout.addWidget(self._aggregate_log)
+
+        layout.addWidget(gb)
+        layout.addStretch()
+        scroll.setWidget(w)
+        return scroll
+
+    def _aggregate_select_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Chọn file báo cáo Excel", "",
+                                                 "Excel Files (*.xlsx)")
+        for f in files:
+            self._aggregate_file_list.addItem(f)
+
+    def _on_run_aggregate(self):
+        files = [self._aggregate_file_list.item(i).text()
+                 for i in range(self._aggregate_file_list.count())]
+        if not files:
+            QMessageBox.warning(self, "Cảnh báo", "Chọn ít nhất 1 file báo cáo Excel.")
+            return
+        template = self._template_real
+        if not template or not Path(template).exists():
+            QMessageBox.critical(self, "Lỗi", "Chọn file Mẫu xuất hàng hợp lệ ở tab Tệp dữ liệu.")
+            return
+        out_dir = self.output_row.get_real_path() or str(BASE_DIR / "outputs")
+
+        self._aggregate_log.clear()
+        self._aggregate_run_btn.setEnabled(False)
+
+        def _run():
+            self._ag_log("info", f"📊 Bắt đầu tổng hợp {len(files)} file...")
+            for f in files:
+                self._ag_log("dim", f"  📄 {Path(f).name}")
+            try:
+                result = aggregate_reports(files, out_dir, template)
+                self._ag_log("ok", f"  ✓ {result['rows']} SKU | Qty={result['tong_qty']} | "
+                                    f"Sold={result['tong_sold']} | Promo={result['tong_promo']}")
+                fp = result['files'].get('xlsx_report')
+                if fp and Path(fp).exists():
+                    self._add_result(fp)
+                    self._ag_log("ok", f"  📊 {Path(fp).name}")
+                pdf_fp = result['files'].get('pdf_report')
+                if pdf_fp and Path(pdf_fp).exists():
+                    self._add_result(pdf_fp, label='📄')
+                self._ag_log("bold_ok", "✅ Tổng hợp hoàn tất")
+            except Exception as e:
+                self._ag_log("err", f"✗ Lỗi: {e}")
+            finally:
+                self._aggregate_run_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _ag_log(self, tag: str, msg: str):
+        """Ghi log vào aggregate log view (thread-safe qua signal)."""
+        self._test_log.emit(tag, f"[Tổng hợp] {msg}")
 
     # ═══════════════════════════════════════════════════════
     # BOTTOM BAR
@@ -1888,6 +2341,9 @@ class App(QMainWindow):
     def _update_retail_status(self):
         self.retail_row.update_excel_status()
 
+    def _update_template_status(self):
+        self.template_row.update_excel_status()
+
     def _on_cookie_changed(self, path: str):
         self._cookie_real = path
         self._update_cookie_status()
@@ -1901,6 +2357,10 @@ class App(QMainWindow):
         self._retail_real = path
         self._update_retail_status()
         self._load_preview_data()
+
+    def _on_template_changed(self, path: str):
+        self._template_real = path
+        self._update_template_status()
 
     def _on_output_dir_changed(self, path: str):
         os.makedirs(path, exist_ok=True)
@@ -2056,10 +2516,12 @@ class App(QMainWindow):
             "output_dir": self.output_row.get_real_path() or str(BASE_DIR / "outputs"),
             "master": self._master_real,
             "retail": self._retail_real,
+            "template": self._template_real,
             "carriers": carriers_to_process,
             "auto_print": self.auto_print_cb.isChecked(),
             "printer": self.printer_combo.currentText(),
             "test_mode": self.test_mode_cb.isChecked(),
+            "exclude_pre_orders": self.exclude_pre_orders_cb.isChecked(),
             "batch_size": self.batch_size_spin.value(),
             "pdf_settings": self._build_pdf_settings(),
         }
@@ -2078,16 +2540,6 @@ class App(QMainWindow):
         self.printer_combo.addItems(printers)
         if printers:
             self.printer_combo.setCurrentIndex(0)
-
-    def _on_sumatra_path_changed(self, text: str):
-        global _custom_sumatra_path
-        _custom_sumatra_path = text.strip()
-
-    def _browse_sumatra_path(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Chọn SumatraPDF.exe", "",
-                                              "SumatraPDF (SumatraPDF.exe);;All Files (*.*)")
-        if path:
-            self.sumatra_path_edit.setText(path)
 
     # ═══════════════════════════════════════════════════════
     # LOG (colored HTML via QTextEdit)
@@ -2193,9 +2645,16 @@ class App(QMainWindow):
         if not config['carriers']:
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn ít nhất 1 hãng vận chuyển để in.")
             return
+
+        # ── Tính output_dir với date subfolder ──
+        base_dir = config['output_dir']
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        out_dir = str(Path(base_dir) / today_str)
+        os.makedirs(out_dir, exist_ok=True)
+        config['output_dir'] = out_dir  # Ghi đè = path có ngày
+
         self.running = True
         self._set_buttons("running")
-        self._clear_results()
         self._clear_log()
         self._log_html("bold_ok", "▶ Bắt đầu...")
         self.status_label.setText("⏳ Đang xử lý...")
@@ -2210,19 +2669,42 @@ class App(QMainWindow):
         if mode == "once":
             self._on_run_now()
             return
-        if mode == "daily":
-            times = [t.strip() for t in self.daily_times_edit.text().split(",") if t.strip()]
-            if not times:
-                QMessageBox.critical(self, "Lỗi", "Nhập ít nhất 1 giờ (VD: 08:00).")
+        if mode == "weekly":
+            # Parse per-day config
+            day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
+            self._sched_weekly_config = {}
+            has_any = False
+
+            for idx in range(7):
+                if not self.weekly_day_checkboxes[idx].isChecked():
+                    continue
+
+                time_text = self.weekly_day_time_edits[idx].text().strip()
+                if not time_text:
+                    continue  # checked but no times entered → skip silently
+
+                parts = [t.strip() for t in time_text.split(",") if t.strip()]
+                parsed = []
+                for t in parts:
+                    try:
+                        h, m = t.split(":")
+                        h_int, m_int = int(h), int(m)
+                        if not (0 <= h_int <= 23 and 0 <= m_int <= 59):
+                            raise ValueError
+                        parsed.append((h_int, m_int))
+                    except (ValueError, TypeError):
+                        QMessageBox.critical(self, "Lỗi",
+                            f"Giờ không hợp lệ cho {day_names[idx]}: '{t}'. Nhập dạng HH:MM (0-23:0-59).")
+                        return
+
+                if parsed:
+                    self._sched_weekly_config[idx] = sorted(parsed)
+                    has_any = True
+
+            if not has_any:
+                QMessageBox.critical(self, "Lỗi",
+                    "Vui lòng chọn ít nhất một ngày và nhập ít nhất một khung giờ.")
                 return
-            self._sched_daily_times = []
-            for t in times:
-                try:
-                    h, m = t.strip().split(":")
-                    self._sched_daily_times.append((int(h), int(m)))
-                except ValueError:
-                    QMessageBox.critical(self, "Lỗi", f"Giờ không hợp lệ: {t}")
-                    return
         elif mode == "interval":
             self._sched_interval_hours = self.interval_spin.value()
 
@@ -2231,8 +2713,12 @@ class App(QMainWindow):
         self._log_html("info", f"⏰ Hẹn giờ: {mode}")
         if mode == "interval":
             self._log_html("info", f"   Chạy mỗi {self._sched_interval_hours} giờ")
-        elif mode == "daily":
-            self._log_html("info", f"   Chạy lúc {self.daily_times_edit.text()}")
+        elif mode == "weekly":
+            day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
+            for idx in range(7):
+                if idx in self._sched_weekly_config:
+                    times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in self._sched_weekly_config[idx])
+                    self._log_html("info", f"   {day_names[idx]}: {times_str}")
 
         self._sched_mode = mode
         self.scheduler_active = True
@@ -2258,7 +2744,44 @@ class App(QMainWindow):
         mode = btn.property("mode")
         self._sched_mode = mode
         self.interval_panel.setVisible(mode == "interval")
-        self.daily_panel.setVisible(mode == "daily")
+        self.weekly_panel.setVisible(mode == "weekly")
+
+    # ═══════════════════════════════════════════════════════
+    # WEEKLY SCHEDULER HELPERS
+    # ═══════════════════════════════════════════════════════
+    def _on_weekly_apply_all(self):
+        """Copy nội dung ô giờ mẫu vào tất cả các ngày đang checked."""
+        master_text = self.weekly_master_time_edit.text()
+        for idx in range(7):
+            if self.weekly_day_checkboxes[idx].isChecked():
+                self.weekly_day_time_edits[idx].setText(master_text)
+
+    def _find_next_run_today(self, now: datetime) -> datetime | None:
+        """Tìm timeslot tiếp theo trong ngày hôm nay. Trả về None nếu hôm nay hết slot."""
+        day_idx = now.weekday()  # Python: 0=Monday → khớp với idx của ta
+        slots = self._sched_weekly_config.get(day_idx, [])
+        best = None
+        for h, m in slots:
+            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if candidate > now and (best is None or candidate < best):
+                best = candidate
+        return best
+
+    def _calc_next_weekly_run(self, from_time: datetime) -> datetime | None:
+        """Quét tối đa 8 ngày tới, tìm timeslot sớm nhất. Dùng cho countdown display."""
+        best = None
+        for offset in range(8):
+            check_date = from_time.date() + timedelta(days=offset)
+            day_idx = check_date.weekday()
+            day_slots = self._sched_weekly_config.get(day_idx, [])
+            for h, m in day_slots:
+                candidate = datetime(check_date.year, check_date.month, check_date.day, h, m, 0, 0)
+                if candidate > from_time and (best is None or candidate < best):
+                    best = candidate
+            # Nếu đã tìm thấy slot trong ngày đang xét thì dừng (không cần quét tiếp)
+            if best is not None and best.date() == check_date:
+                break
+        return best
 
     # ═══════════════════════════════════════════════════════
     # SCHEDULER (QTimer-based, main thread)
@@ -2279,22 +2802,20 @@ class App(QMainWindow):
                 self._execute_scheduled_job()
             else:
                 self._update_countdown()
-        elif self._sched_mode == "daily":
-            candidates = []
-            for h, m in self._sched_daily_times:
-                rt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                if rt < now:
-                    rt += timedelta(days=1)
-                candidates.append(rt)
-            if candidates:
-                next_run = min(candidates)
-                self._sched_next_run = next_run
-                diff = (next_run - now).total_seconds()
+        elif self._sched_mode == "weekly":
+            now = datetime.now()
+            next_today = self._find_next_run_today(now)
+            if next_today is not None:
+                self._sched_next_run = next_today
+                diff = (next_today - now).total_seconds()
                 if diff <= 1:
                     if not self._sched_last_run or (now - self._sched_last_run).total_seconds() > 60:
                         self._execute_scheduled_job()
                 else:
                     self._update_countdown()
+            else:
+                self._sched_next_run = self._calc_next_weekly_run(now)
+                self._update_countdown()
 
     def _execute_scheduled_job(self):
         if self.running:
@@ -2304,11 +2825,18 @@ class App(QMainWindow):
         if not config['carriers']:
             self._log_html("warn", "⏭ Bỏ qua chu kỳ — không có hãng nào được chọn")
             return
+
+        # ── Tính output_dir với date subfolder ──
+        base_dir = config['output_dir']
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        out_dir = str(Path(base_dir) / today_str)
+        os.makedirs(out_dir, exist_ok=True)
+        config['output_dir'] = out_dir
+
         self.running = True
         self._clear_results()
         self.status_label.setText("🔄 Đang chạy tác vụ tự động...")
         self.status_label.setStyleSheet("color: #D97706; font-weight: bold; font-size: 14px;")
-        config = self._collect_config()
         self.trigger_job.emit(config)
 
     def _update_countdown(self):
@@ -2320,14 +2848,91 @@ class App(QMainWindow):
             self.status_label.setStyleSheet("color: #2563EB; font-weight: bold; font-size: 14px;")
 
     # ═══════════════════════════════════════════════════════
+    # CONFIG PERSISTENCE
+    # ═══════════════════════════════════════════════════════
+    def _save_config(self):
+        """Lưu cấu hình hiện tại ra file JSON."""
+        carrier_keys = ["jt", "ghn", "vnp", "best", "viettel", "jtc"]
+        data = {
+            'cookie': self._cookie_real,
+            'master': self._master_real,
+            'retail': self._retail_real,
+            'template': self._template_real,
+            'output_dir': self.output_row.get_real_path(),
+            'carriers': {k: {
+                'checked': self.carrier_checkboxes[k].isChecked(),
+                'count': self.carrier_spinboxes[k].value(),
+            } for k in carrier_keys},
+            'auto_print': self.auto_print_cb.isChecked(),
+            'printer': self.printer_combo.currentText(),
+            'duplex': self.duplex_combo.currentIndex(),
+            'batch_size': self.batch_size_spin.value(),
+            'exclude_pre_orders': self.exclude_pre_orders_cb.isChecked(),
+            'sched_mode': self._sched_mode,
+            'sched_interval_hours': self._sched_interval_hours,
+        }
+        try:
+            self._config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        except OSError:
+            pass
+
+    def _load_config(self):
+        """Nạp cấu hình từ file JSON (nếu có)."""
+        if not self._config_path.exists():
+            return
+        try:
+            data = json.loads(self._config_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        for key, attr in [('cookie', '_cookie_real'), ('master', '_master_real'),
+                          ('retail', '_retail_real'), ('template', '_template_real')]:
+            saved = data.get(key, '')
+            if saved and Path(saved).exists():
+                setattr(self, attr, saved)
+
+        saved_out = data.get('output_dir', '')
+        if saved_out and Path(saved_out).exists():
+            self.output_row.set_path(saved_out)
+            self.output_row._update_status_dir()
+
+        saved_carriers = data.get('carriers', {})
+        for k, v in saved_carriers.items():
+            if k in self.carrier_checkboxes:
+                self.carrier_checkboxes[k].setChecked(v.get('checked', True))
+                self.carrier_spinboxes[k].setValue(v.get('count', 0))
+
+        self.auto_print_cb.setChecked(data.get('auto_print', False))
+        saved_printer = data.get('printer', '')
+        if saved_printer:
+            idx = self.printer_combo.findText(saved_printer)
+            if idx >= 0: self.printer_combo.setCurrentIndex(idx)
+        idx_duplex = data.get('duplex', -1)
+        if 0 <= idx_duplex < self.duplex_combo.count():
+            self.duplex_combo.setCurrentIndex(idx_duplex)
+        self.batch_size_spin.setValue(data.get('batch_size', 15))
+        self.exclude_pre_orders_cb.setChecked(data.get('exclude_pre_orders', True))
+
+        self._sched_mode = data.get('sched_mode', 'once')
+        self._sched_interval_hours = data.get('sched_interval_hours', 1)
+
+        self.cookie_row.set_path(self._cookie_real)
+        self.master_row.set_path(self._master_real)
+        self.retail_row.set_path(self._retail_real)
+        self.template_row.set_path(self._template_real)
+        self._update_cookie_status()
+        self._update_master_status()
+        self._update_retail_status()
+        self._update_template_status()
+
+    # ═══════════════════════════════════════════════════════
     # CLOSE EVENT
     # ═══════════════════════════════════════════════════════
     def closeEvent(self, event):
         self.scheduler_active = False
         self._sched_timer.stop()
         self.running = False
-        # shutdown() chứa browser.close() + playwright.stop() là process-level, không phụ thuộc thread
-        # Gọi trực tiếp là an toàn; invokeMethod + BlockingQueuedConnection có thể deadlock nếu worker đang bận
+        self._save_config()
         self._worker.shutdown()
         self._worker_thread.quit()
         self._worker_thread.wait(5000)

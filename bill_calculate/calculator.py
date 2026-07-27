@@ -230,15 +230,17 @@ def extract_order_counts(
             full_sku = prefix_map[candidate]
             counts[full_sku] += qty
         elif candidate.endswith('-') and candidate in ambiguous_map:
-            # Prefix ambiguous: thu doan tu context sau Order ID
+            # Prefix ambiguous: chon suffix DAI NHAT found trong context
+            # (tranh bug: suffix "2" thang "BOG17-2" vi xuat hien truoc)
             options = ambiguous_map[candidate]
-            after_text = flat_text[match.end():match.end()+120]
+            after_text = flat_text[match.end():match.end()+200]
             best_match = None
+            best_len = 0
             for opt in options:
                 suffix = opt[len(candidate):]
-                if suffix and suffix in after_text:
+                if suffix and suffix in after_text and len(suffix) > best_len:
                     best_match = opt
-                    break
+                    best_len = len(suffix)
             if best_match:
                 counts[best_match] += qty
         elif candidate.endswith('-'):
@@ -345,17 +347,17 @@ def generate_grouped_excel(results: list[dict], output_path: str, carrier: str =
     ws.title = "Sheet1"
 
     # ── Styles ──
-    title_font = Font(name="Arial", size=14, bold=True, color="1F4E79")
+    title_font = Font(name="Arial", size=16, bold=True, color="1F4E79")
     title_align = Alignment(horizontal="center", vertical="center")
-    hdr_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    hdr_font = Font(name="Arial", size=13, bold=True, color="FFFFFF")
     hdr_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
     hdr_align = Alignment(horizontal="center", vertical="center")
     thin_border = Border(
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
-    data_font = Font(name="Arial", size=10)
-    total_font = Font(name="Arial", size=10, bold=True)
+    data_font = Font(name="Arial", size=12)
+    total_font = Font(name="Arial", size=12, bold=True)
 
     # ── Title row (dòng nhận diện khi in giấy) ──
     ncols = 7  # STT, SKU, Tên SP, ĐVT, SL, SL bán, SL KM
@@ -431,77 +433,433 @@ def generate_grouped_excel(results: list[dict], output_path: str, carrier: str =
 
 
 # ============================================================
-# PDF GENERATION (gộp theo SKU)
+# EXPORT XLSX → PDF (via Excel COM)
 # ============================================================
 
-def generate_grouped_pdf(results: list[dict], output_path: str, carrier: str = '', source_label: str = '', order_count: int = 0) -> str:
-    """Tạo file PDF báo cáo gộp theo SKU."""
-    # Gộp theo SKU
-    grouped = {}
+def export_xlsx_to_pdf(xlsx_path: str, pdf_path: str = '') -> str:
+    """
+    Dùng Excel COM để export file .xlsx sang .pdf.
+    Yêu cầu: máy phải cài Microsoft Excel.
+    Trả về đường dẫn file PDF, hoặc '' nếu thất bại.
+    """
+    import pythoncom
+    import win32com.client
+    import os as _os
+
+    if not pdf_path:
+        pdf_path = xlsx_path.rsplit('.', 1)[0] + '.pdf'
+
+    try:
+        pythoncom.CoInitialize()
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        abs_xlsx = _os.path.abspath(xlsx_path)
+        abs_pdf = _os.path.abspath(pdf_path)
+        workbook = excel.Workbooks.Open(abs_xlsx)
+        # 0 = xlTypePDF
+        workbook.ExportAsFixedFormat(0, abs_pdf)
+        workbook.Close(False)
+        excel.Quit()
+        print(f"   📄 Đã xuất PDF: {_os.path.basename(pdf_path)}")
+        return pdf_path
+    except Exception as e:
+        print(f"   ⚠ Không thể xuất PDF từ Excel: {e}")
+        return ''
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+# ============================================================
+# REPORT AGGREGATION (tổng hợp nhiều file báo cáo)
+# ============================================================
+
+def extract_report_data(file_path: str) -> list[dict]:
+    """
+    Đọc một file báo cáo Phieu_xuat_hang_*.xlsx (đã được fill_template)
+    và trích xuất dữ liệu SKU từ cả 2 panel (trái + phải).
+
+    Trả về list[dict] dạng:
+      {seller_sku, sku, qty, qty_sold, promo_qty, unit, product_name}
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(file_path, data_only=True)
+    ws = wb.active
+    results: list[dict] = []
+
+    for row_idx in range(3, ws.max_row + 1):
+        # ── Panel trái: B=SKU, C=Tên SP, D=ĐVT, E=SL, F=SL bán, G=SL KM ──
+        sku_left = ws.cell(row=row_idx, column=2).value  # Cột B
+        if sku_left and str(sku_left).strip():
+            sku = str(sku_left).strip().upper()
+            product_name = str(ws.cell(row=row_idx, column=3).value or '').strip()
+            unit = str(ws.cell(row=row_idx, column=4).value or '').strip()
+            qty = _safe_int(ws.cell(row=row_idx, column=5).value)
+            qty_sold = _safe_int(ws.cell(row=row_idx, column=6).value)
+            promo_qty = _safe_int(ws.cell(row=row_idx, column=7).value)
+            results.append({
+                "seller_sku": sku,
+                "sku": sku,
+                "qty": qty,
+                "qty_sold": qty_sold,
+                "promo_qty": promo_qty,
+                "unit": unit,
+                "product_name": product_name,
+            })
+
+        # ── Panel phải: I=SKU, J=Tên SP, K=ĐVT, L=SL, M=SL bán, N=SL KM ──
+        sku_right = ws.cell(row=row_idx, column=9).value  # Cột I
+        if sku_right and str(sku_right).strip():
+            sku = str(sku_right).strip().upper()
+            product_name = str(ws.cell(row=row_idx, column=10).value or '').strip()
+            unit = str(ws.cell(row=row_idx, column=11).value or '').strip()
+            qty = _safe_int(ws.cell(row=row_idx, column=12).value)
+            qty_sold = _safe_int(ws.cell(row=row_idx, column=13).value)
+            promo_qty = _safe_int(ws.cell(row=row_idx, column=14).value)
+            results.append({
+                "seller_sku": sku,
+                "sku": sku,
+                "qty": qty,
+                "qty_sold": qty_sold,
+                "promo_qty": promo_qty,
+                "unit": unit,
+                "product_name": product_name,
+            })
+
+    wb.close()
+    print(f"   📥 Đã trích xuất {len(results)} dòng từ: {os.path.basename(file_path)}")
+    return results
+
+
+def _safe_int(val) -> int:
+    """Chuyển value sang int an toàn (None / str / float → int)."""
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        try:
+            return int(float(val))
+        except (ValueError, TypeError):
+            return 0
+
+
+def aggregate_reports(
+    report_files: list[str],
+    output_dir: str,
+    template_path: str,
+) -> dict:
+    """
+    Tổng hợp nhiều file báo cáo Phieu_xuat_hang_*.xlsx thành 1 file duy nhất.
+    - Trích xuất dữ liệu từ từng file
+    - Gộp theo SKU, cộng dồn số lượng
+    - Điền vào template và lưu ra file mới
+
+    Trả về dict kết quả (cùng format với process_all).
+    """
+    from collections import defaultdict
+
+    if not report_files:
+        raise ValueError("Không có file báo cáo nào để tổng hợp")
+
+    if not os.path.exists(template_path):
+        raise ValueError(f"Không tìm thấy file template tại: {template_path}")
+
+    # ── Trích xuất + gộp dữ liệu từ tất cả file ──
+    merged: dict[str, dict] = {}  # {sku: {qty, qty_sold, promo_qty, product_name, unit}}
+    total_files = 0
+
+    for fp in report_files:
+        if not os.path.exists(fp):
+            print(f"   ⚠ Bỏ qua file không tồn tại: {fp}")
+            continue
+        try:
+            rows = extract_report_data(fp)
+            if not rows:
+                print(f"   ⚠ Không trích xuất được dữ liệu từ: {os.path.basename(fp)}")
+                continue
+            total_files += 1
+            for r in rows:
+                sku = r["sku"]
+                if sku not in merged:
+                    merged[sku] = {
+                        "qty": 0, "qty_sold": 0, "promo_qty": 0,
+                        "product_name": "", "unit": "",
+                    }
+                merged[sku]["qty"] += r["qty"]
+                merged[sku]["qty_sold"] += r["qty_sold"]
+                merged[sku]["promo_qty"] += r["promo_qty"]
+                if not merged[sku]["product_name"] and r.get("product_name", ""):
+                    merged[sku]["product_name"] = r["product_name"]
+                if not merged[sku]["unit"] and r.get("unit", ""):
+                    merged[sku]["unit"] = r["unit"]
+        except Exception as e:
+            print(f"   ⚠ Lỗi xử lý {os.path.basename(fp)}: {e}")
+
+    if not merged:
+        raise ValueError("Không trích xuất được dữ liệu từ file nào")
+
+    # ── Chuyển về định dạng results cho fill_template ──
+    results = [
+        {
+            "seller_sku": sku,
+            "sku": sku,
+            "qty": info["qty"],
+            "qty_sold": info["qty_sold"],
+            "promo_qty": info["promo_qty"],
+            "unit": info["unit"],
+            "product_name": info["product_name"],
+        }
+        for sku, info in merged.items()
+    ]
+
+    print(f"\n📊 TỔNG HỢP {total_files} file: {len(results)} SKU | "
+          f"Qty={sum(r['qty'] for r in results)} | "
+          f"Sold={sum(r['qty_sold'] for r in results)} | "
+          f"Promo={sum(r['promo_qty'] for r in results)}")
+
+    # ── Điền vào template ──
+    now = datetime.now()
+    output_path = os.path.join(output_dir, f"Phieu_xuat_hang_Tong_hop_{now.strftime('%m-%d_%H-%M-%S')}.xlsx")
+
+    fill_template(results, template_path, output_path, carrier='Tổng hợp', order_count=total_files)
+
+    # ── Xuất PDF ──
+    pdf_path = ''
+    try:
+        pdf_path = export_xlsx_to_pdf(output_path)
+    except Exception as e:
+        print(f"   ⚠ Không xuất được PDF: {e}")
+
+    files_dict = {"xlsx_report": output_path}
+    if pdf_path:
+        files_dict["pdf_report"] = pdf_path
+
+    return {
+        "base_name": f"Tổng hợp ({total_files} file)",
+        "rows": len(results),
+        "tong_qty": sum(r["qty"] for r in results),
+        "tong_sold": sum(r["qty_sold"] for r in results),
+        "tong_promo": sum(r["promo_qty"] for r in results),
+        "files": files_dict,
+    }
+
+
+# ============================================================
+# TEMPLATE FILLING (điền số lượng vào mẫu Bảng thống kê hàng.xlsx)
+# ============================================================
+
+def fill_template(
+    results: list[dict],
+    template_path: str,
+    output_path: str,
+    carrier: str = '',
+    order_count: int = 0,
+) -> str:
+    """
+    Mở file mẫu Bảng thống kê hàng.xlsx, điền số lượng (SL, SL bán, SL KM)
+    vào các dòng có SKU khớp, rồi lưu ra file mới.
+    Các SKU không có sẵn trong template sẽ được tự động thêm vào dòng trống
+    hoặc append vào cuối.
+
+    Template có 2 panel:
+      - Trái:  cột B = Mã sản phẩm,  E = SL,  F = SL bán,  G = SL KM
+      - Phải:  cột I = Mã sản phẩm,  L = SL,  M = SL bán,  N = SL KM
+    """
+    from openpyxl import load_workbook
+    from copy import copy
+
+    wb = load_workbook(template_path)
+    ws = wb.active
+
+    # ── Build lookup từ results: key = sku (và cả seller_sku) ──
+    # Gộp theo sku (phòng trường hợp nhiều dòng cùng sku)
+    grouped: dict[str, dict] = {}
     for r in results:
         sku = r["sku"]
         if sku not in grouped:
-            grouped[sku] = {"qty": 0, "qty_sold": 0, "promo_qty": 0, "unit": r.get("unit", ""), "product_name": r.get("product_name", "")}
+            grouped[sku] = {"qty": 0, "qty_sold": 0, "promo_qty": 0, "product_name": "", "unit": ""}
         grouped[sku]["qty"] += r["qty"]
         grouped[sku]["qty_sold"] += r["qty_sold"]
         grouped[sku]["promo_qty"] += r["promo_qty"]
         if not grouped[sku]["product_name"] and r.get("product_name", ""):
             grouped[sku]["product_name"] = r["product_name"]
+        if not grouped[sku]["unit"] and r.get("unit", ""):
+            grouped[sku]["unit"] = r["unit"]
 
-    grouped_list = [{"sku": k, **v} for k, v in grouped.items()]
-    grouped_list.sort(key=lambda x: x["sku"])
+    # Build index: ánh xạ seller_sku → sku (để match cả combo code)
+    seller_to_sku: dict[str, str] = {}
+    for r in results:
+        if r["seller_sku"] != r["sku"]:
+            seller_to_sku[r["seller_sku"]] = r["sku"]
 
-    pdf = FPDF(orientation='L', unit='mm', format='A4')
-    pdf.set_auto_page_break(auto=True, margin=10)
-    pdf.add_font('Arial', '', r'C:\Windows\Fonts\Arial.ttf', uni=True)
-    pdf.add_font('Arial', 'B', r'C:\Windows\Fonts\Arialbd.ttf', uni=True)
-    pdf.add_page()
+    def find_qty(sku_code: str):
+        """Tìm số lượng cho một mã SKU bất kỳ (có thể là seller_sku hoặc sku)."""
+        if sku_code in grouped:
+            return grouped[sku_code]
+        if sku_code in seller_to_sku:
+            real_sku = seller_to_sku[sku_code]
+            if real_sku in grouped:
+                return grouped[real_sku]
+        return None
 
-    # Tiêu đề
-    if carrier and source_label:
-        title = f'{carrier} — {source_label}'
-    else:
-        title = carrier or source_label or 'Bao cao gop SKU'
-    if order_count > 0:
-        title += f' — ({order_count} don)'
-    pdf.set_font('Arial', 'B', 14)
-    pdf.cell(0, 10, title, align='C')
-    pdf.ln(12)
+    # ── Panel trái: cột B (SKU), cột E (SL), F (SL bán), G (SL KM) ──
+    matched_skus: set[str] = set()
+    filled_left = 0
+    for row_idx in range(3, ws.max_row + 1):
+        sku_cell = ws.cell(row=row_idx, column=2)  # Cột B
+        sku_code = str(sku_cell.value).strip() if sku_cell.value else ''
+        if not sku_code:
+            continue
+        qty_info = find_qty(sku_code)
+        if qty_info:
+            ws.cell(row=row_idx, column=5, value=qty_info["qty"])       # SL
+            ws.cell(row=row_idx, column=6, value=qty_info["qty_sold"])  # SL bán
+            ws.cell(row=row_idx, column=7, value=qty_info["promo_qty"]) # SL KM
+            filled_left += 1
+            matched_skus.add(sku_code)
 
-    # Bảng — tận dụng tối đa chiều ngang A4 (297mm)
-    col_w = [10, 28, 155, 24, 16, 18, 18]  # STT, SKU, Ten SP, DVT, SL, SL ban, SL KM
-    headers = ['STT', 'SKU', 'Ten SP', 'DVT', 'SL', 'SL ban', 'SL KM']
-    pdf.set_font('Arial', 'B', 8)
-    pdf.set_fill_color(47, 84, 150)
-    pdf.set_text_color(255, 255, 255)
-    for i, (h, w) in enumerate(zip(headers, col_w)):
-        pdf.cell(w, 10, h, border=1, fill=True, align='C')
-    pdf.ln()
+    # ── Panel phải: cột I (SKU), cột L (SL), M (SL bán), N (SL KM) ──
+    filled_right = 0
+    for row_idx in range(3, ws.max_row + 1):
+        sku_cell = ws.cell(row=row_idx, column=9)  # Cột I
+        sku_code = str(sku_cell.value).strip() if sku_cell.value else ''
+        if not sku_code:
+            continue
+        qty_info = find_qty(sku_code)
+        if qty_info:
+            ws.cell(row=row_idx, column=12, value=qty_info["qty"])       # SL
+            ws.cell(row=row_idx, column=13, value=qty_info["qty_sold"])  # SL bán
+            ws.cell(row=row_idx, column=14, value=qty_info["promo_qty"]) # SL KM
+            filled_right += 1
+            matched_skus.add(sku_code)
 
-    # Data
-    pdf.set_font('Arial', '', 9)
-    pdf.set_text_color(0, 0, 0)
-    tong_qty = tong_sold = tong_promo = 0
-    for i, r in enumerate(grouped_list, 1):
-        vals = [str(i), r['sku'], r.get('product_name', ''), r.get('unit', ''),
-                str(r['qty']), str(r['qty_sold']), str(r['promo_qty'])]
-        aligns = ['C', 'L', 'L', 'C', 'R', 'R', 'R']
-        for v, w, a in zip(vals, col_w, aligns):
-            pdf.cell(w, 9, v, border=1, align=a)
-        pdf.ln()
-        tong_qty += r['qty']; tong_sold += r['qty_sold']; tong_promo += r['promo_qty']
+    # ── Thêm các SKU chưa có trong template vào dòng trống hoặc append cuối ──
+    unmatched: list[dict] = []
+    for sku, info in grouped.items():
+        # Kiểm tra cả sku và seller_sku đều chưa được match
+        if sku not in matched_skus:
+            # Tìm seller_sku tương ứng
+            seller = sku
+            for s, r in seller_to_sku.items():
+                if r == sku:
+                    seller = s
+                    break
+            if seller not in matched_skus:
+                unmatched.append({"sku": sku, **info})
 
-    # Total
-    pdf.set_font('Arial', 'B', 9)
-    total_vals = ['', 'Tong', '', '', str(tong_qty), str(tong_sold), str(tong_promo)]
-    total_aligns = ['C', 'L', 'C', 'C', 'R', 'R', 'R']
-    for v, w, a in zip(total_vals, col_w, total_aligns):
-        pdf.cell(w, 10, v, border=1, align=a)
+    added_count = 0
+    if unmatched:
+        # Lấy style từ dòng dữ liệu cuối cùng có SKU để áp dụng cho dòng mới
+        # Tìm dòng tham chiếu (dòng 3)
+        ref_row = 3
 
-    pdf.output(output_path)
-    print(f'   📄 Đã tạo PDF: {output_path}')
+        # Xác định max_row hiện tại
+        current_max = ws.max_row
+
+        for item in unmatched:
+            # Tìm vị trí trống đầu tiên trong panel trái hoặc phải
+            placed = False
+
+            # Ưu tiên điền vào dòng trống có sẵn (có STT nhưng chưa có SKU)
+            for row_idx in range(3, current_max + 1):
+                # Panel trái: ô B trống
+                b_val = ws.cell(row=row_idx, column=2).value
+                if not b_val or str(b_val).strip() == '':
+                    # Điền vào panel trái
+                    ws.cell(row=row_idx, column=2, value=item["sku"])
+                    ws.cell(row=row_idx, column=3, value=item.get("product_name", ""))
+                    ws.cell(row=row_idx, column=4, value=item.get("unit", ""))
+                    ws.cell(row=row_idx, column=5, value=item["qty"])
+                    ws.cell(row=row_idx, column=6, value=item["qty_sold"])
+                    ws.cell(row=row_idx, column=7, value=item["promo_qty"])
+                    placed = True
+                    added_count += 1
+                    break
+
+                # Panel phải: ô I trống
+                i_val = ws.cell(row=row_idx, column=9).value
+                if not i_val or str(i_val).strip() == '':
+                    # Điền vào panel phải
+                    ws.cell(row=row_idx, column=9, value=item["sku"])
+                    ws.cell(row=row_idx, column=10, value=item.get("product_name", ""))
+                    ws.cell(row=row_idx, column=11, value=item.get("unit", ""))
+                    ws.cell(row=row_idx, column=12, value=item["qty"])
+                    ws.cell(row=row_idx, column=13, value=item["qty_sold"])
+                    ws.cell(row=row_idx, column=14, value=item["promo_qty"])
+                    placed = True
+                    added_count += 1
+                    break
+
+            # Nếu không còn dòng trống → append dòng mới vào cuối
+            if not placed:
+                new_row = current_max + 1
+                ws.cell(row=new_row, column=1, value=new_row - 2)  # STT
+                ws.cell(row=new_row, column=2, value=item["sku"])
+                ws.cell(row=new_row, column=3, value=item.get("product_name", ""))
+                ws.cell(row=new_row, column=4, value=item.get("unit", ""))
+                ws.cell(row=new_row, column=5, value=item["qty"])
+                ws.cell(row=new_row, column=6, value=item["qty_sold"])
+                ws.cell(row=new_row, column=7, value=item["promo_qty"])
+                current_max = new_row
+                added_count += 1
+
+    # ── Cập nhật tiêu đề (dòng 1) ──
+    now = datetime.now()
+    carrier_str = carrier if carrier else ''
+    title_parts = ['Phiếu xuất hàng ngày :']
+    title_parts.append(f'SL đơn: {order_count}')
+    if carrier_str:
+        title_parts.append(f'ĐVVC: {carrier_str}')
+    title_parts.append(now.strftime('%d/%m/%Y %H:%M'))
+    ws.cell(row=1, column=1).value = '    '.join(title_parts)
+
+    # ── Cập nhật print area & page setup để in cả 2 cột ──
+    # Template gốc có print area chỉ $B$1:$G$29 (cột trái), cần mở rộng ra cả cột phải
+    last_col_letter = 'N'
+    # Set print area với sheet name để ghi đè triệt để template cũ
+    ws.print_area = f"'{ws.title}'!$A$1:${last_col_letter}${ws.max_row}"
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_setup.paperSize = 9  # A4
+
+    # ── Lề giấy hẹp để tận dụng tối đa không gian in ──
+    ws.page_margins.left = 0.25     # ~0.6 cm
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.3       # ~0.8 cm
+    ws.page_margins.bottom = 0.3
+    ws.page_margins.header = 0.0
+    ws.page_margins.footer = 0.0
+
+    # ── Set độ rộng cột để lấp đầy trang A4 ngang ──
+    # Tổng ~175 — vượt vùng in (~160) để fitToWidth=1 scale xuống vừa khít,
+    # tránh khoảng trống bên phải do Excel không tự scale lên.
+    col_widths = {
+        'A': 5,  'B': 13, 'C': 28, 'D': 11, 'E': 10, 'F': 10, 'G': 10,
+        'H': 5,  'I': 13, 'J': 26, 'K': 11, 'L': 10, 'M': 10, 'N': 10,
+    }
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    # ── Set độ cao hàng ──
+    ws.row_dimensions[1].height = 30   # Tiêu đề
+    ws.row_dimensions[2].height = 30   # Header cột
+    for r in range(3, ws.max_row + 1):
+        ws.row_dimensions[r].height = 23   # Dòng dữ liệu
+
+    wb.save(output_path)
+    wb.close()
+
+    total_filled = filled_left + filled_right
+    print(f'   📊 Đã điền số lượng cho {total_filled} SKU (trái={filled_left}, phải={filled_right}) vào template')
+    if added_count > 0:
+        print(f'   ➕ Đã thêm {added_count} SKU mới không có sẵn trong template')
+    print(f'   💾 Đã lưu: {os.path.basename(output_path)}')
     return output_path
-
 
 
 # ============================================================
@@ -514,10 +872,12 @@ def process_all(
     master_path: str | None = None,
     retail_path: str | None = None,
     carrier: str = '',
+    template_path: str | None = None,
 ) -> list[dict]:
     """
     Xu ly toan bo pipeline cho nhieu file PDF cung 1 carrier.
     TAT CA PDF duoc gop chung vao 1 file bao cao duy nhat.
+    Ket qua duoc dien vao template Bảng thống kê hàng.xlsx.
     """
     if master_path is None:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -525,6 +885,14 @@ def process_all(
 
     if not os.path.exists(master_path):
         raise ValueError(f"Khong tim thay file master_data tai: {master_path}")
+
+    # Tự động tìm template nếu không được chỉ định
+    if template_path is None:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        template_path = os.path.join(base, "Bảng thống kê hàng.xlsx")
+
+    if not os.path.exists(template_path):
+        raise ValueError(f"Khong tim thay file template tai: {template_path}")
 
     # Load master data (combo)
     print(f"Load master data: {master_path}")
@@ -568,18 +936,24 @@ def process_all(
           f"Sold={sum(r['qty_sold'] for r in results)} | "
           f"Promo={sum(r['promo_qty'] for r in results)}")
 
-    # Sinh 1 file PDF duy nhat
+    # Điền số lượng vào template thay vì tạo PDF
     now = datetime.now()
     carrier_safe = carrier.replace(' ', '_').replace('&', 'n') if carrier else ''
-    prefix = f"Bao_cao_gop_SKU_{carrier_safe}_" if carrier_safe else "Bao_cao_gop_SKU_"
-    pdf_path = os.path.join(output_dir, f"{prefix}{now.strftime('%m-%d_%H-%M-%S')}.pdf")
+    prefix = f"Phieu_xuat_hang_{carrier_safe}_" if carrier_safe else "Phieu_xuat_hang_"
+    output_path = os.path.join(output_dir, f"{prefix}{now.strftime('%m-%d_%H-%M-%S')}.xlsx")
 
-    if carrier:
-        source_label = f"{len(pdf_files)} Picking list — {now.strftime('%d/%m %H:%M')}"
-    else:
-        source_label = f"{len(pdf_files)} Picking list — {now.strftime('%d/%m %H:%M')}"
+    fill_template(results, template_path, output_path, carrier=carrier, order_count=total_order_qty)
 
-    generate_grouped_pdf(results, pdf_path, carrier=carrier, source_label=source_label, order_count=total_order_qty)
+    # ── Xuất PDF từ file Excel vừa tạo ──
+    pdf_path = ''
+    try:
+        pdf_path = export_xlsx_to_pdf(output_path)
+    except Exception as e:
+        print(f"   ⚠ Không xuất được PDF: {e}")
+
+    files_dict = {"xlsx_report": output_path}
+    if pdf_path:
+        files_dict["pdf_report"] = pdf_path
 
     return [{
         "base_name": f"Combined {carrier or 'all'}",
@@ -587,7 +961,7 @@ def process_all(
         "tong_qty": sum(r["qty"] for r in results),
         "tong_sold": sum(r["qty_sold"] for r in results),
         "tong_promo": sum(r["promo_qty"] for r in results),
-        "files": {"pdf_report": pdf_path},
+        "files": files_dict,
     }]
 
 
