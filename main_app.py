@@ -321,40 +321,25 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 }""")
                 log_cb(f'  📋 Header checkbox đã chọn {header_checked}/{total_avail} đơn', 'info')
 
-                # ── Phân biệt Case 1 vs Case 2 dựa vào sự TỒN TẠI của nút "Chọn tất cả" ──
-                # Case 1: trang chỉ có đúng ≤20 đơn thật → KHÔNG có nút "Chọn tất cả"
-                #         → dùng luôn header_checked, không cần tìm nút.
-                # Case 2: trang đầy 20 đơn nhưng thực tế có >20 đơn → CÓ nút
-                #         "Chọn tất cả X đơn" hoặc "Chọn X đơn hàng đầu tiên"
-                #         → bấm nút đó để chọn toàn bộ đơn ở tất cả các trang.
-                #
-                # Quan trọng: phải kiểm tra sự tồn tại của nút TRƯỚC KHI quyết định.
-                # Nếu đoán sai (Case 1 mà vẫn cố tìm & bấm) → toggle off → mất hết checkbox.
+                # ── Phân biệt Case 1 vs Case 2 dựa vào sự TỒN TẠI của nút ──
+                # TikTok chỉ có 2 loại nút: "Chọn X đơn hàng đầu tiên" hoặc "Chọn tất cả X đơn hàng"
+                # Cả 2 đều chứa "Chọn" + "đơn hàng" — dùng cả 2 từ để tránh nhầm nút khác
+                # ("Xuất đơn hàng", "Lọc đơn hàng"... có "đơn hàng" nhưng không có "Chọn")
 
-                # ── Tìm nút "Chọn tất cả" bằng selector cụ thể (không quét toàn bộ) ──
+                # ── Tìm button chứa "đơn hàng", sau đó lọc thêm "chọn" ──
                 select_all_btn = None
-                for sel in [
-                    'button:has-text("Chọn tất cả")',
-                    'button:has-text("Chọn")',
-                    'button:has-text("Select all")',
-                    'button:has-text("Select")',
-                ]:
-                    try:
-                        candidates = page.locator(sel).all()
-                        for b in candidates:
-                            try:
-                                txt = b.inner_text().strip().lower()
-                                if (('chọn' in txt or 'select' in txt)
-                                        and ('đơn' in txt or 'order' in txt)):
-                                    if b.is_visible():
-                                        select_all_btn = b
-                                        break
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    if select_all_btn:
-                        break
+                try:
+                    candidates = page.locator('button:has-text("đơn hàng")').all()
+                    for b in candidates:
+                        try:
+                            txt = b.inner_text().strip().lower()
+                            if 'chọn' in txt and b.is_visible():
+                                select_all_btn = b
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
                 if select_all_btn:
                     # ✅ Case 2: Tìm thấy nút "Chọn tất cả" → có >20 đơn
@@ -392,17 +377,16 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         checked = header_checked
                         log_cb(f'  ✓ Đã chọn lại {checked} đơn hàng', 'ok')
 
-                    # ── Phân biệt 2 loại nút để quyết định có chạy batch tiếp không ──
+                    # ── Phân biệt 2 loại nút ──
+                    # "Chọn X đơn hàng ĐẦU TIÊN" → còn đơn, chạy tiếp
+                    # "Chọn TẤT CẢ X đơn hàng" → hết đơn, dừng
                     btn_text_lower = btn_text.lower()
-                    if ('tất cả' in btn_text_lower or 'select all' in btn_text_lower):
+                    if 'tất cả' in btn_text_lower:
                         force_stop = True
-                        log_cb(f'  🏁 Nút "Chọn tất cả" → đã chọn hết đơn, batch này là cuối cùng', 'dim')
-                    elif ('đầu tiên' in btn_text_lower or 'first' in btn_text_lower):
-                        force_stop = False
-                        log_cb(f'  🔄 Nút "Chọn X đầu tiên" → còn đơn phía sau, sẽ chạy batch tiếp theo', 'info')
+                        log_cb(f'  🏁 "Chọn tất cả" → đã chọn hết đơn, dừng', 'dim')
                     else:
-                        force_stop = True
-                        log_cb(f'  ⚠ Không xác định được loại nút → dừng sau batch này để an toàn', 'warn')
+                        force_stop = False
+                        log_cb(f'  🔄 "Chọn X đầu tiên" → còn đơn, chạy batch tiếp', 'info')
                     select_all_batches += 1
                 else:
                     # ✅ Case 1: KHÔNG có nút "Chọn tất cả" → chỉ có đúng ≤20 đơn thật
