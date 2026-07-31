@@ -498,6 +498,60 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             else:
                 log_cb('  ℹ Không có popup cùng địa chỉ — tiếp tục...', 'dim')
 
+            # ── Helper: tìm & click nút "Tiếp tục" (popup xác nhận trung gian) ──
+            # Có thể bị overlay (vd "Phí vận chuyển") chặn → thử nhiều cách, không lỗi
+            def _try_click_tieptuc(reason=''):
+                for _ in range(5):
+                    for sel_text in ['Tiếp tục', 'Continue', 'Xác nhận', 'Confirm', 'OK']:
+                        try:
+                            candidates = page.locator(f'button:has-text("{sel_text}")').all()
+                            for btn in candidates:
+                                try:
+                                    txt = btn.inner_text().strip().lower()
+                                    if not btn.is_visible(timeout=300):
+                                        continue
+                                    if 'không kết hợp' in txt or 'without combining' in txt:
+                                        continue
+                                    if 'do not combine' in txt:
+                                        continue
+                                    if 'tiếp theo' in txt or 'next' in txt:
+                                        continue
+                                    if sel_text.lower() in txt:
+                                        # Thử click bình thường
+                                        try:
+                                            btn.click(timeout=2000)
+                                            log_cb(f'  ✓ Đã bấm "{txt[:40]}" {reason}', 'ok')
+                                            page.wait_for_timeout(2000)
+                                            return True
+                                        except Exception:
+                                            # Bị chặn → thử force click
+                                            try:
+                                                btn.click(force=True, timeout=2000)
+                                                log_cb(f'  ✓ Đã force-click "{txt[:40]}" {reason}', 'ok')
+                                                page.wait_for_timeout(2000)
+                                                return True
+                                            except Exception:
+                                                # Force cũng fail → thử JS dispatchEvent
+                                                try:
+                                                    btn.dispatch_event('click')
+                                                    log_cb(f'  ✓ Đã JS-click "{txt[:40]}" {reason}', 'ok')
+                                                    page.wait_for_timeout(2000)
+                                                    return True
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(800)
+                return False
+
+            # ── Popup xác nhận trung gian (TikTok mới thêm sau bước "cùng địa chỉ") ──
+            state_cb('printing', f'Batch {batch_num}: Kiểm tra popup xác nhận trung gian...')
+            clicked_tieptuc = _try_click_tieptuc('(popup xác nhận trung gian)')
+            if not clicked_tieptuc:
+                log_cb('  ℹ Không có popup xác nhận trung gian — tiếp tục...', 'dim')
+
             state_cb('printing', f'Batch {batch_num}: Đợi popup "Tiếp theo"...')
             tieptheo_btn = None
             for _ in range(10):
@@ -517,6 +571,8 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 tieptheo_btn.click(timeout=5000)
                 log_cb('  ✓ Đã bấm "Tiếp theo"', 'ok')
                 page.wait_for_timeout(4000)
+                # Thử click "Tiếp tục" lần nữa (phòng overlay "Phí vận chuyển" đã biến mất)
+                _try_click_tieptuc('(sau "Tiếp theo")')
 
                 state_cb('printing', f'Batch {batch_num}: Chọn loại chứng từ...')
                 page.wait_for_timeout(3000)
@@ -530,6 +586,8 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                                 log_cb(f'  ✓ Đã tick: {doc_label}', 'ok')
                     except: pass
                 page.wait_for_timeout(2000)
+                # Thử click "Tiếp tục" lần nữa trước khi in
+                _try_click_tieptuc('(trước "In nhãn ngay")')
 
                 in_btn = None
                 for btn_text in ['In nhãn ngay sau khi vận chuyển', 'In nhãn ngay', 'Print label immediately']:
@@ -742,7 +800,7 @@ class AutomationWorker(QObject):
             printer = config['printer']
             test_mode = config['test_mode']
             exclude_pre_orders = config.get('exclude_pre_orders', True)
-            batch_size = config.get('batch_size', 15)
+            batch_size = config.get('batch_size', 55)
             pdf_settings = config.get('pdf_settings', 'paper=A4')
             carriers = config['carriers']
 
@@ -784,6 +842,9 @@ class AutomationWorker(QObject):
                 if auto_print and pdf_paths:
                     self.log_message.emit('info', f'🖨️ [{carrier_display}]: In shipping label...')
                     for p in pdf_paths:
+                        if self._stop_event.is_set():
+                            self.log_message.emit('warn', '⏹ Đã dừng in — hủy các file còn lại.');
+                            break
                         name = Path(p).name
                         if not (Path(p).exists() and ('shipping' in name.lower() or 'vận chuyển' in name.lower())):
                             continue
@@ -795,7 +856,7 @@ class AutomationWorker(QObject):
                             self.log_message.emit('err', f'  ✗ Lỗi in {Path(p).name}: {e}')
 
                 carrier_results = []
-                if pdf_paths:
+                if pdf_paths and not self._stop_event.is_set():
                     self.log_message.emit('info', f'📊 Đang tính bill [{carrier_display}]...')
                     carrier_results = run_calculator(
                         pdf_paths, out_dir, master, retail, template,
@@ -810,18 +871,25 @@ class AutomationWorker(QObject):
                     all_results.extend(carrier_results)
 
                 # In báo cáo sau khi tính toán
-                if auto_print and carrier_results:
+                if auto_print and carrier_results and not self._stop_event.is_set():
                     for r in carrier_results:
+                        if self._stop_event.is_set():
+                            self.log_message.emit('warn', '⏹ Đã dừng in báo cáo.');
+                            break
                         fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
                         if fp and Path(fp).exists():
                             try:
                                 for copy_num in [1, 2]:
+                                    if self._stop_event.is_set():
+                                        self.log_message.emit('warn', '⏹ Đã dừng in báo cáo.');
+                                        break
                                     self.log_message.emit('info', f'  🖨️ In bản {copy_num}/2: {Path(fp).name}')
                                     _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
                                                 log_cb=lambda m, t='': self.log_message.emit(t, m))
                                     if copy_num == 1:
                                         import time as _t3; _t3.sleep(2)
-                                self.log_message.emit('ok', f'  ✓ Đã in báo cáo 2 bản: {Path(fp).name}')
+                                if not self._stop_event.is_set():
+                                    self.log_message.emit('ok', f'  ✓ Đã in báo cáo 2 bản: {Path(fp).name}')
                             except Exception as e:
                                 self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
 
@@ -858,6 +926,18 @@ class AutomationWorker(QObject):
 
     @Slot()
     def stop_job(self): self._stop_event.set()
+
+    def shutdown_browser(self):
+        """Force-close browser NGAY LẬP TỨC (thread-safe, gọi từ main thread)."""
+        self._stop_event.set()
+        br = self._browser
+        if br is not None:
+            try:
+                br.close()
+            except Exception:
+                pass
+        # Không stop playwright ở đây — chỉ close browser.
+        # stop playwright gọi vào native code dễ crash nếu đang dở việc.
 
     @Slot()
     def shutdown(self):
@@ -906,7 +986,7 @@ def _wait_print_queue(printer_name, max_jobs=2, timeout=600):
         _t.sleep(1)  # kiểm tra mỗi 1 giây
 
 
-def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=15):
+def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=55):
     import subprocess, os as _os
     fp = str(file_path)
 
@@ -1201,7 +1281,7 @@ class App(QMainWindow):
         self.result_files = []
         self._stop_event = threading.Event()
 
-        self._sched_mode = "once"
+        self._sched_mode = "weekly"
         self._sched_interval_hours = 1
         self._sched_weekly_config: dict[int, list[tuple[int, int]]] = {}  # 0=Thứ 2..6=Chủ Nhật
         self._sched_next_run = None
@@ -1650,7 +1730,7 @@ class App(QMainWindow):
         paper_row.addWidget(QLabel("  Batch in (tờ/lần):"))
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 100)
-        self.batch_size_spin.setValue(15)
+        self.batch_size_spin.setValue(55)
         self.batch_size_spin.setFixedWidth(60)
         self.batch_size_spin.setToolTip("Số tờ in mỗi lần, tránh máy in quá tải")
         paper_row.addWidget(self.batch_size_spin)
@@ -1721,7 +1801,6 @@ class App(QMainWindow):
         self.sched_button_group = QButtonGroup(self)
 
         self.once_rb = QRadioButton("▶ Chạy ngay lập tức 1 lần duy nhất")
-        self.once_rb.setChecked(True)
         self.once_rb.setProperty("mode", "once")
         self.sched_button_group.addButton(self.once_rb)
         gb_layout.addWidget(self.once_rb)
@@ -1750,6 +1829,7 @@ class App(QMainWindow):
         gb_layout.addWidget(self.interval_panel)
 
         self.weekly_rb = QRadioButton("📅 Chạy theo lịch hàng tuần")
+        self.weekly_rb.setChecked(True)
         self.weekly_rb.setProperty("mode", "weekly")
         self.sched_button_group.addButton(self.weekly_rb)
         gb_layout.addWidget(self.weekly_rb)
@@ -1764,7 +1844,7 @@ class App(QMainWindow):
         quick_row = QHBoxLayout()
         quick_row.setSpacing(8)
         quick_row.addWidget(QLabel("Nhập giờ mẫu:"))
-        self.weekly_master_time_edit = QLineEdit("08:00, 14:00, 20:00")
+        self.weekly_master_time_edit = QLineEdit("07:30, 13:20, 15:10, 16:10, 17:10, 18:10")
         self.weekly_master_time_edit.setFixedWidth(200)
         self.weekly_master_time_edit.setToolTip("Định dạng HH:MM, phân cách bằng dấu phẩy")
         quick_row.addWidget(self.weekly_master_time_edit)
@@ -1791,14 +1871,14 @@ class App(QMainWindow):
 
             cb = QCheckBox(name)
             cb.setFixedWidth(90)
-            cb.setChecked(idx < 5)  # Mặc định T2-T6 checked, T7+CN unchecked
+            cb.setChecked(idx < 6)  # Mặc định T2-T7 checked, CN unchecked
             cb.setStyleSheet("font-weight: 500;")
             self.weekly_day_checkboxes[idx] = cb
 
-            te = QLineEdit("08:00, 14:00, 20:00" if idx < 5 else "")
+            te = QLineEdit("07:30, 13:20, 15:10, 16:10, 17:10, 18:10" if idx < 6 else "")
             te.setFixedWidth(220)
-            te.setEnabled(idx < 5)
-            te.setPlaceholderText("VD: 08:00, 14:00")
+            te.setEnabled(idx < 6)
+            te.setPlaceholderText("VD: 07:30, 13:20, 15:10")
             self.weekly_day_time_edits[idx] = te
 
             # Checkbox toggle -> enable/disable time edit
@@ -1810,7 +1890,7 @@ class App(QMainWindow):
             wp_outer.addLayout(day_row)
 
         wp_outer.addStretch()
-        self.weekly_panel.hide()
+        self.weekly_panel.show()
         gb_layout.addWidget(self.weekly_panel)
 
         self.sched_button_group.buttonClicked.connect(self._on_schedule_mode_changed)
@@ -2197,6 +2277,12 @@ class App(QMainWindow):
         btn_add.clicked.connect(self._aggregate_select_files)
         btn_row.addWidget(btn_add)
 
+        btn_today = QPushButton("📅 Tổng hợp hôm nay")
+        btn_today.setObjectName("schedBtn")
+        btn_today.setCursor(Qt.PointingHandCursor)
+        btn_today.clicked.connect(self._on_aggregate_today)
+        btn_row.addWidget(btn_today)
+
         btn_clear = QPushButton("🗑 Xóa danh sách")
         btn_clear.setObjectName("smallBtn")
         btn_clear.setCursor(Qt.PointingHandCursor)
@@ -2234,6 +2320,35 @@ class App(QMainWindow):
                                                  "Excel Files (*.xlsx)")
         for f in files:
             self._aggregate_file_list.addItem(f)
+
+    def _on_aggregate_today(self):
+        """Tìm tất cả file Phieu_xuat_hang_*.xlsx trong thư mục hôm nay và thêm vào danh sách."""
+        base_dir = self.output_row.get_real_path() or str(BASE_DIR / "outputs")
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_dir = Path(base_dir) / today_str
+
+        if not today_dir.exists():
+            QMessageBox.warning(self, "Thông báo",
+                f"Thư mục hôm nay chưa tồn tại:\n{today_dir}")
+            return
+
+        xlsx_files = sorted(today_dir.glob("Phieu_xuat_hang_*.xlsx"))
+        if not xlsx_files:
+            QMessageBox.information(self, "Thông báo",
+                f"Không tìm thấy file Phieu_xuat_hang_*.xlsx nào trong:\n{today_dir}")
+            return
+
+        # Xóa danh sách cũ và thêm file hôm nay vào
+        self._aggregate_file_list.clear()
+        for f in xlsx_files:
+            self._aggregate_file_list.addItem(str(f))
+
+        self._ag_log("info", f"📅 Đã tìm thấy {len(xlsx_files)} file báo cáo hôm nay ({today_str})")
+        for f in xlsx_files:
+            self._ag_log("dim", f"  📄 {f.name}")
+
+        # Tự động chạy tổng hợp luôn
+        self._on_run_aggregate()
 
     def _on_run_aggregate(self):
         files = [self._aggregate_file_list.item(i).text()
@@ -2715,10 +2830,13 @@ class App(QMainWindow):
         self.scheduler_active = False
         self._sched_timer.stop()
         self.running = False
-        # Dùng invokeMethod để gửi lệnh stop qua event queue của worker thread (đúng chuẩn Qt)
-        # threading.Event.set() là thread-safe nên nếu invokeMethod thất bại, direct call vẫn an toàn
-        if not QMetaObject.invokeMethod(self._worker, "stop_job", Qt.QueuedConnection):
-            self._worker.stop_job()  # fallback an toàn vì chỉ set threading.Event
+        # ── Gọi TRỰC TIẾP stop_job (threading.Event.set() là thread-safe) ──
+        # KHÔNG dùng invokeMethod với QueuedConnection vì worker thread
+        # đang block trong subprocess.run / Playwright wait → event queue
+        # không được xử lý → stop_event không bao giờ được set!
+        self._worker.stop_job()
+        # ── Force-close browser để hủy tiến trình con ngay lập tức ──
+        self._worker.shutdown_browser()
         self._set_buttons("idle")
         self.status_label.setText("⏹ Đã dừng")
         self.status_label.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 14px;")
@@ -2894,10 +3012,10 @@ class App(QMainWindow):
         idx_duplex = data.get('duplex', -1)
         if 0 <= idx_duplex < self.duplex_combo.count():
             self.duplex_combo.setCurrentIndex(idx_duplex)
-        self.batch_size_spin.setValue(data.get('batch_size', 15))
+        self.batch_size_spin.setValue(data.get('batch_size', 55))
         self.exclude_pre_orders_cb.setChecked(data.get('exclude_pre_orders', True))
 
-        self._sched_mode = data.get('sched_mode', 'once')
+        self._sched_mode = data.get('sched_mode', 'weekly')
         self._sched_interval_hours = data.get('sched_interval_hours', 1)
 
         self.cookie_row.set_path(self._cookie_real)
