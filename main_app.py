@@ -800,7 +800,7 @@ class AutomationWorker(QObject):
             printer = config['printer']
             test_mode = config['test_mode']
             exclude_pre_orders = config.get('exclude_pre_orders', True)
-            batch_size = config.get('batch_size', 55)
+            batch_size = config.get('batch_size', 0)
             pdf_settings = config.get('pdf_settings', 'paper=A4')
             carriers = config['carriers']
 
@@ -949,23 +949,180 @@ class AutomationWorker(QObject):
             if self._playwright: self._playwright.stop()
         except: pass
 
-_foxit_exe_cache = None
+def _set_printer_devmode(printer_name, orientation=0, duplex=0):
+    """Thay đổi DEVMODE của máy in (orientation, duplex) QUA REGISTRY — Edge nhìn thấy.
+    orientation: 1=dọc (portrait), 2=ngang (landscape), 0=giữ nguyên
+    duplex: 1=1 mặt, 2=2 mặt lật cạnh dài, 3=2 mặt lật cạnh ngắn, 0=giữ nguyên
+    Trả về (old_orientation, old_duplex) để khôi phục sau."""
+    import win32print, win32con
+
+    if orientation == 0 and duplex == 0:
+        return (0, 0)
+
+    hprinter = win32print.OpenPrinter(printer_name)
+    try:
+        prn_info = win32print.GetPrinter(hprinter, 2)
+        devmode = prn_info['pDevMode']
+        old_orientation = devmode.Orientation
+        old_duplex = devmode.Duplex
+
+        changed = False
+        if orientation in (1, 2):
+            devmode.Orientation = orientation
+            changed = True
+        if duplex in (1, 2, 3):
+            devmode.Duplex = duplex
+            changed = True
+
+        if changed:
+            win32print.SetPrinter(hprinter, 9, {'pDevMode': devmode}, 0)
+
+        return (old_orientation, old_duplex)
+    finally:
+        win32print.ClosePrinter(hprinter)
 
 
-def _find_foxit_exe():
-    """Tìm Foxit PDF Reader — dùng XPS Print Path, spool nhẹ ~15MB."""
-    global _foxit_exe_cache
-    if _foxit_exe_cache is not None:
-        return _foxit_exe_cache or ''
-    foxit_paths = [
-        r'C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
-        r'C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
+def _print_pdf_via_edge(file_path, printer_name, log_cb=None):
+    """In PDF qua Microsoft Edge + kiosk-printing (dùng Playwright).
+    Tự động detect hướng PDF, nếu ngang thì xoay 90° cho khớp in dọc.
+    Trả về True nếu thành công."""
+    import subprocess as _sp, os as _os
+
+    temp_pdf = None  # Track temp file để dọn sau khi in
+
+    # ── Detect hướng PDF: nếu ngang → xoay 90° cho khớp giấy dọc máy in ──
+    # Edge --kiosk-printing luôn in portrait bất kể DEVMODE máy in
+    try:
+        from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
+        r = _PdfReader(file_path)
+        if r.pages:
+            pg = r.pages[0]
+            mb = pg.mediabox
+            w, h = float(mb.width), float(mb.height)
+            rot = abs(float(getattr(pg, 'rotation', 0) or 0)) % 360
+            if rot in (90, 270):
+                w, h = h, w
+
+            if w > h:  # PDF landscape → phải xoay
+                rotated_path = os.path.join(os.path.dirname(file_path),
+                    '__rotated_' + os.path.basename(file_path))
+                writer = _PdfWriter()
+                for _pg in r.pages:
+                    _pg.rotate(90)
+                    writer.add_page(_pg)
+                writer.write(rotated_path)
+                temp_pdf = rotated_path
+                file_path = rotated_path
+                if log_cb:
+                    log_cb(f'  📐 PDF ngang ({int(w)}x{int(h)}) → xoay 90° cho khớp in dọc', 'dim')
+            elif log_cb:
+                log_cb(f'  📐 PDF dọc ({int(w)}x{int(h)}) → in thẳng', 'dim')
+    except Exception:
+        pass  # Không detect/xoay được thì in nguyên bản
+
+    # ── Lưu & đặt máy in mặc định (kiosk-printing in ra default printer) ──
+    try:
+        import win32print as _wp
+        old_default = _wp.GetDefaultPrinter()
+        _wp.SetDefaultPrinter(printer_name)
+    except Exception:
+        old_default = ''
+        if log_cb: log_cb('  ⚠ Không thể đặt máy in mặc định — dùng máy in hiện tại', 'warn')
+
+    pw = None
+    browser = None
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            channel='msedge',
+            headless=False,
+            args=['--kiosk-printing']
+        )
+        page = browser.new_page()
+
+        # ── Nếu file_path có space, copy vào temp không space (Playwright encode %20 Edge không hiểu) ──
+        import tempfile, shutil as _shutil
+        if ' ' in file_path:
+            space_temp = os.path.join(tempfile.gettempdir(), os.path.basename(file_path).replace(' ', '_'))
+            _shutil.copy2(file_path, space_temp)
+            # Nếu trước đó đã có temp (rotate) thì xóa file rotate cũ
+            if temp_pdf:
+                try: os.remove(temp_pdf)
+                except: pass
+            temp_pdf = space_temp
+            file_path = space_temp
+
+        file_url = 'file:///' + file_path.replace('\\', '/')
+        page.goto(file_url, wait_until='domcontentloaded', timeout=30000)
+        page.wait_for_timeout(5000)
+
+        page.evaluate('window.print()')
+
+        # ── Poll queue đến khi job complete, error, hoặc queue trống (đã in xong) ──
+        if log_cb: log_cb('  ⏳ Đợi job spool vào máy in...', 'dim')
+        deadline = __import__('time').time() + 600
+        last_status = ''
+        while __import__('time').time() < deadline:
+            __import__('time').sleep(5)
+            result = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+                f"(Get-PrintJob -PrinterName '{printer_name}' -ErrorAction SilentlyContinue | Where-Object {{ $_.DocumentName -like '*{_os.path.basename(file_path)[:30]}*' }} | Select-Object -ExpandProperty JobStatus) -join ';'"
+            ], capture_output=True, text=True,
+               creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            status = result.stdout.strip()
+            if status and status != last_status:
+                if log_cb: log_cb(f'  🖨️ Trạng thái: {status}', 'dim')
+                last_status = status
+            if status:
+                if 'Complete' in status and 'Printing' not in status and 'Spooling' not in status:
+                    if log_cb: log_cb('  ✅ Job đã hoàn thành', 'ok')
+                    break
+                if 'Error' in status:
+                    if log_cb: log_cb(f'  ⚠ Job báo lỗi: {status}', 'warn')
+                    break
+            else:
+                if last_status:
+                    if log_cb: log_cb('  ✅ Job đã in xong (queue trống)', 'ok')
+                    break
+
+        return True
+    except Exception as e:
+        if log_cb: log_cb(f'  ✗ Lỗi in Edge: {e}', 'err')
+        return False
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+        # ── Dọn temp file (cả space fix + rotated) ──
+        if temp_pdf:
+            try:
+                os.remove(temp_pdf)
+            except Exception:
+                pass
+        # ── Khôi phục máy in mặc định ──
+        if old_default:
+            try:
+                import win32print as _wp2
+                _wp2.SetDefaultPrinter(old_default)
+            except Exception:
+                pass
+
+
+def _find_edge_exe():
+    """Tìm Microsoft Edge — dùng cho Playwright kiosk printing (có sẵn trên Windows 10/11)."""
+    edge_paths = [
+        r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+        r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
     ]
-    for fp in foxit_paths:
+    for fp in edge_paths:
         if Path(fp).exists():
-            _foxit_exe_cache = fp
             return fp
-    _foxit_exe_cache = ''
     return ''
 
 
@@ -986,17 +1143,16 @@ def _wait_print_queue(printer_name, max_jobs=2, timeout=600):
         _t.sleep(1)  # kiểm tra mỗi 1 giây
 
 
-def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=55):
+def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=0):
     import subprocess, os as _os
     fp = str(file_path)
 
     try:
         if fp.lower().endswith('.pdf'):
-            foxit_exe = _find_foxit_exe()
-            if not foxit_exe:
+            if not _find_edge_exe():
                 raise RuntimeError(
-                    'Không tìm thấy Foxit PDF Reader. '
-                    'Vui lòng cài Foxit PDF Reader để in file PDF.'
+                    'Không tìm thấy Microsoft Edge. '
+                    'Edge là trình duyệt có sẵn trên Windows 10/11.'
                 )
 
             print_path = fp
@@ -1009,49 +1165,45 @@ def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, b
                     if temp_merged: print_path = temp_merged
                 except: pass
 
-            if foxit_exe:
-                # ── Đọc số trang để quyết định batch splitting ──
-                try:
-                    from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
-                    reader = _PdfReader(print_path)
-                    total_pages = len(reader.pages)
-                except Exception:
-                    reader = None
-                    total_pages = 0
+            # ── Đọc số trang để quyết định batch splitting ──
+            try:
+                from pypdf import PdfReader as _PdfReader, PdfWriter as _PdfWriter
+                reader = _PdfReader(print_path)
+                total_pages = len(reader.pages)
+            except Exception:
+                reader = None
+                total_pages = 0
 
-                # ── Batch splitting ──
-                if reader and total_pages > batch_size:
-                    total_batches = (total_pages + batch_size - 1) // batch_size
-                    if log_cb: log_cb(f'  📦 Foxit: Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
-                    batch_num = 0
-                    for start in range(0, total_pages, batch_size):
-                        batch_num += 1
-                        end = min(start + batch_size, total_pages)
-                        if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
-                        batch_writer = _PdfWriter()
-                        for i in range(start, end):
-                            batch_writer.add_page(reader.pages[i])
-                        batch_path = print_path + f'.batch{batch_num}.pdf'
-                        with open(batch_path, 'wb') as bf:
-                            batch_writer.write(bf)
+            # ── Batch splitting ──
+            if batch_size > 0 and reader and total_pages > batch_size:
+                total_batches = (total_pages + batch_size - 1) // batch_size
+                if log_cb: log_cb(f'  📦 Edge kiosk: Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
+                batch_num = 0
+                for start in range(0, total_pages, batch_size):
+                    batch_num += 1
+                    end = min(start + batch_size, total_pages)
+                    if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
+                    batch_writer = _PdfWriter()
+                    for i in range(start, end):
+                        batch_writer.add_page(reader.pages[i])
+                    batch_path = print_path + f'.batch{batch_num}.pdf'
+                    with open(batch_path, 'wb') as bf:
+                        batch_writer.write(bf)
 
-                        _wait_print_queue(printer_name, max_jobs=2)
-                        cmd = [foxit_exe, '/t', batch_path, printer_name]
-                        result = subprocess.run(cmd, check=False, timeout=600)
-                        if result.returncode != 0:
-                            raise RuntimeError(f'Foxit batch {batch_num} exit code: {result.returncode}')
+                    _wait_print_queue(printer_name, max_jobs=2)
+                    if not _print_pdf_via_edge(batch_path, printer_name, log_cb=log_cb):
+                        raise RuntimeError(f'Edge kiosk batch {batch_num} thất bại')
 
-                        try: _os.remove(batch_path)
-                        except: pass
+                    try: _os.remove(batch_path)
+                    except: pass
 
-                    _wait_print_queue(printer_name)
-                else:
-                    # ── In thẳng không batch ──
-                    _wait_print_queue(printer_name)
-                    cmd = [foxit_exe, '/t', print_path, printer_name]
-                    result = subprocess.run(cmd, check=False, timeout=600)
-                    if result.returncode != 0:
-                        raise RuntimeError(f'Foxit exit code: {result.returncode}')
+                _wait_print_queue(printer_name)
+            else:
+                # ── In thẳng không batch ──
+                _wait_print_queue(printer_name)
+                if not _print_pdf_via_edge(print_path, printer_name, log_cb=log_cb):
+                    raise RuntimeError('Edge kiosk printing thất bại')
+
             if temp_merged:
                 def _cleanup(p=temp_merged):
                     import time; time.sleep(5)
@@ -1729,34 +1881,34 @@ class App(QMainWindow):
 
         paper_row.addWidget(QLabel("  Batch in (tờ/lần):"))
         self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 100)
-        self.batch_size_spin.setValue(55)
+        self.batch_size_spin.setRange(0, 100)
+        self.batch_size_spin.setValue(0)
         self.batch_size_spin.setFixedWidth(60)
-        self.batch_size_spin.setToolTip("Số tờ in mỗi lần, tránh máy in quá tải")
+        self.batch_size_spin.setToolTip("0 = không chia batch. Nhập số >0 để chia nhỏ file in")
+        self.batch_size_spin.setSpecialValueText("0 (không chia)")
         paper_row.addWidget(self.batch_size_spin)
 
         paper_row.addStretch()
         gb_layout.addLayout(paper_row)
 
-        # ── Engine in PDF: Foxit PDF Reader (XPS Print Path, spool ~15MB) ──
-        foxit_detected = _find_foxit_exe()
+        # ── Engine in PDF: Microsoft Edge (kiosk printing qua Playwright) ──
+        edge_detected = _find_edge_exe()
 
-        # Label hiển thị engine in PDF
         engine_label = QLabel("Engine in PDF:")
         engine_label.setFixedWidth(130)
         engine_label.setStyleSheet("font-weight: 600; color: #1E293B; font-size: 10pt;")
 
-        foxit_status = QLabel()
-        foxit_status.setWordWrap(True)
-        if foxit_detected:
-            foxit_status.setText("✅ Foxit PDF Reader — XPS Print Path (spool ~15MB)")
-            foxit_status.setStyleSheet("color: #059669; font-size: 9pt; padding: 2px 0;")
+        edge_status = QLabel()
+        edge_status.setWordWrap(True)
+        if edge_detected:
+            edge_status.setText("✅ Microsoft Edge — Kiosk Printing (tự động poll queue)")
+            edge_status.setStyleSheet("color: #059669; font-size: 9pt; padding: 2px 0;")
         else:
-            foxit_status.setText("⚠ Chưa cài Foxit PDF Reader — Vui lòng cài để in file PDF!")
-            foxit_status.setStyleSheet("color: #DC2626; font-weight: 600; font-size: 10pt; padding: 2px 0;")
+            edge_status.setText("⚠ Không tìm thấy Microsoft Edge — Edge có sẵn trên Windows 10/11!")
+            edge_status.setStyleSheet("color: #DC2626; font-weight: 600; font-size: 10pt; padding: 2px 0;")
 
         gb_layout.addWidget(engine_label)
-        gb_layout.addWidget(foxit_status)
+        gb_layout.addWidget(edge_status)
 
         # ── Chrome info ──
         chrome_info = QLabel("🌐 Sử dụng Google Chrome có sẵn trên máy")
@@ -3012,7 +3164,7 @@ class App(QMainWindow):
         idx_duplex = data.get('duplex', -1)
         if 0 <= idx_duplex < self.duplex_combo.count():
             self.duplex_combo.setCurrentIndex(idx_duplex)
-        self.batch_size_spin.setValue(data.get('batch_size', 55))
+        self.batch_size_spin.setValue(data.get('batch_size', 0))
         self.exclude_pre_orders_cb.setChecked(data.get('exclude_pre_orders', True))
 
         self._sched_mode = data.get('sched_mode', 'weekly')

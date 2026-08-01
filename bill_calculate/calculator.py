@@ -547,6 +547,32 @@ def _safe_int(val) -> int:
             return 0
 
 
+def _extract_order_count_from_title(file_path: str) -> int:
+    """
+    Đọc dòng tiêu đề (row 1) của file báo cáo Phieu_xuat_hang_*.xlsx
+    để lấy số đơn hàng. Dòng tiêu đề có dạng:
+    "Phiếu xuất hàng ngày :    SL đơn: 50    ĐVVC: J&T    27/07/2026 16:10"
+    """
+    import re
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb.active
+        title = str(ws.cell(row=1, column=1).value or '')
+        wb.close()
+        m = re.search(r'SL đơn:\s*(\d+)', title)
+        if m:
+            return int(m.group(1))
+        # Fallback: thử pattern "(\d+) đơn"
+        m = re.search(r'(\d+)\s*đơn', title)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
 def aggregate_reports(
     report_files: list[str],
     output_dir: str,
@@ -571,6 +597,7 @@ def aggregate_reports(
     # ── Trích xuất + gộp dữ liệu từ tất cả file ──
     merged: dict[str, dict] = {}  # {sku: {qty, qty_sold, promo_qty, product_name, unit}}
     total_files = 0
+    total_order_count = 0  # Tổng số đơn hàng thực tế (đọc từ tiêu đề mỗi file)
 
     for fp in report_files:
         if not os.path.exists(fp):
@@ -582,6 +609,16 @@ def aggregate_reports(
                 print(f"   ⚠ Không trích xuất được dữ liệu từ: {os.path.basename(fp)}")
                 continue
             total_files += 1
+
+            # ── Trích xuất số đơn hàng từ dòng tiêu đề của file báo cáo ──
+            # Dòng tiêu đề có dạng: "Phiếu xuất hàng ngày :    SL đơn: 50    ĐVVC: J&T    27/07/2026 16:10"
+            file_order_count = _extract_order_count_from_title(fp)
+            if file_order_count > 0:
+                total_order_count += file_order_count
+                print(f"   📄 {os.path.basename(fp)}: {file_order_count} đơn")
+            else:
+                print(f"   ⚠ Không đọc được SL đơn từ tiêu đề: {os.path.basename(fp)}")
+
             for r in rows:
                 sku = r["sku"]
                 if sku not in merged:
@@ -616,7 +653,7 @@ def aggregate_reports(
         for sku, info in merged.items()
     ]
 
-    print(f"\n📊 TỔNG HỢP {total_files} file: {len(results)} SKU | "
+    print(f"\n📊 TỔNG HỢP {total_files} file ({total_order_count} đơn): {len(results)} SKU | "
           f"Qty={sum(r['qty'] for r in results)} | "
           f"Sold={sum(r['qty_sold'] for r in results)} | "
           f"Promo={sum(r['promo_qty'] for r in results)}")
@@ -625,7 +662,7 @@ def aggregate_reports(
     now = datetime.now()
     output_path = os.path.join(output_dir, f"Phieu_xuat_hang_Tong_hop_{now.strftime('%m-%d_%H-%M-%S')}.xlsx")
 
-    fill_template(results, template_path, output_path, carrier='Tổng hợp', order_count=total_files)
+    fill_template(results, template_path, output_path, carrier='Tổng hợp', order_count=total_order_count)
 
     # ── Xuất PDF ──
     pdf_path = ''
@@ -639,7 +676,7 @@ def aggregate_reports(
         files_dict["pdf_report"] = pdf_path
 
     return {
-        "base_name": f"Tổng hợp ({total_files} file)",
+        "base_name": f"Tổng hợp ({total_order_count} đơn)",
         "rows": len(results),
         "tong_qty": sum(r["qty"] for r in results),
         "tong_sold": sum(r["qty_sold"] for r in results),
@@ -810,7 +847,7 @@ def fill_template(
     # ── Cập nhật tiêu đề (dòng 1) ──
     now = datetime.now()
     carrier_str = carrier if carrier else ''
-    title_parts = ['Phiếu xuất hàng ngày :']
+    title_parts = ['Phiếu xuất hàng ngày TikTok :']
     title_parts.append(f'SL đơn: {order_count}')
     if carrier_str:
         title_parts.append(f'ĐVVC: {carrier_str}')
