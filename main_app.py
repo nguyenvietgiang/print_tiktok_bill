@@ -1032,13 +1032,12 @@ def _print_pdf_via_edge(file_path, printer_name, log_cb=None):
     pw = None
     browser = None
     try:
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch(
-            channel='msedge',
-            headless=False,
-            args=['--kiosk-printing']
-        )
-        page = browser.new_page()
+        # Dùng Selenium thay Playwright — tránh conflict asyncio loop với Qt/PySide6
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+        options = EdgeOptions()
+        options.add_argument('--kiosk-printing')
+        browser = webdriver.Edge(options=options)
 
         # ── Nếu file_path có space, copy vào temp không space (Playwright encode %20 Edge không hiểu) ──
         import tempfile, shutil as _shutil
@@ -1053,10 +1052,10 @@ def _print_pdf_via_edge(file_path, printer_name, log_cb=None):
             file_path = space_temp
 
         file_url = 'file:///' + file_path.replace('\\', '/')
-        page.goto(file_url, wait_until='domcontentloaded', timeout=30000)
-        page.wait_for_timeout(5000)
+        browser.get(file_url)
+        __import__('time').sleep(5)
 
-        page.evaluate('window.print()')
+        browser.execute_script('window.print();')
 
         # ── Poll queue đến khi job complete, error, hoặc queue trống (đã in xong) ──
         if log_cb: log_cb('  ⏳ Đợi job spool vào máy in...', 'dim')
@@ -1091,12 +1090,7 @@ def _print_pdf_via_edge(file_path, printer_name, log_cb=None):
     finally:
         try:
             if browser:
-                browser.close()
-        except Exception:
-            pass
-        try:
-            if pw:
-                pw.stop()
+                browser.quit()
         except Exception:
             pass
         # ── Dọn temp file (cả space fix + rotated) ──
