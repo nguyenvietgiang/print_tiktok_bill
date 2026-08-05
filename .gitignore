@@ -8,6 +8,7 @@ __pycache__/
 # ── PyInstaller build artifacts ──
 build/
 dist/
+*.spec
 
 # ── Portable distribution ──
 TTS_Bill_Portable/
@@ -40,9 +41,3 @@ package-lock.json
 
 # ── File cũ không dùng nữa ──
 bill_calculate/app.py
-
-# ── Local config ──
-.tts_config.json
-
-# ── SumatraPDF runtime artifacts ──
-SumatraPDF-settings.txt
