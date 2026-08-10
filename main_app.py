@@ -33,14 +33,13 @@ from PySide6.QtGui import (
 BASE_DIR = Path(__file__).parent
 BILL_DIR = BASE_DIR / 'bill_calculate'
 UPLOAD_DIR = BILL_DIR / 'uploads'
-sys.path.insert(0, str(BILL_DIR))
 
 # ═══════════════════════════════════════════════════════════
 # Frozen / source mode — detect paths
 # ═══════════════════════════════════════════════════════════
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
-    BILL_DIR = BASE_DIR / 'bill_calculate'
+    BILL_DIR = Path(sys._MEIPASS) / 'bill_calculate'
     UPLOAD_DIR = BILL_DIR / 'uploads'
     DEFAULT_COOKIE = Path(sys._MEIPASS) / 'seller-vn.tiktok.com_25-06-2026.json'
     MASTER_DEFAULT = Path(sys._MEIPASS) / 'mã combo.xlsx'
@@ -51,6 +50,8 @@ else:
     MASTER_DEFAULT = BASE_DIR / 'mã combo.xlsx'
     RETAIL_DEFAULT = BASE_DIR / 'sp bán lẻ.xlsx'
     TEMPLATE_DEFAULT = BASE_DIR / 'Bảng thống kê hàng.xlsx'
+
+sys.path.insert(0, str(BILL_DIR))
 
 TARGET_URL = 'https://seller-vn.tiktok.com'
 ORDERS_URL = 'https://seller-vn.tiktok.com/order?order_status%5B%5D=1&selected_sort=11&tab=to_ship&page_size=50'
@@ -754,7 +755,7 @@ def _send_order_ids_to_api(order_ids, log_cb, url=None):
 # ============================================================
 # CALCULATOR
 # ============================================================
-def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_path, log_cb, carrier=''):
+def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_path, log_cb, carrier='', send_order_ids=True):
     try:
         from calculator import process_all  # Lazy import — chỉ load khi chạy calculator
     except ImportError:
@@ -771,18 +772,25 @@ def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_pat
             for key, fb in r['files'].items():
                 src, dst = Path(fb), Path(out_dir) / Path(fb).name
                 if src != dst and src.exists(): shutil.copy2(str(src), str(dst)); r['files'][key] = str(dst)
-            # Gửi Order ID lên API nếu có
-            order_id_txt = r['files'].get('order_id_txt')
-            if order_id_txt and Path(order_id_txt).exists():
-                try:
-                    with open(order_id_txt, 'r', encoding='utf-8') as f:
-                        lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
-                    if lines:
-                        _send_order_ids_to_api(lines, log_cb)
-                except Exception as e:
-                    log_cb(f'  ⚠ Lỗi đọc Order ID để gửi API: {e}', 'warn')
+            # Gửi Order ID lên API nếu được bật
+            if send_order_ids:
+                order_id_txt = r['files'].get('order_id_txt')
+                if order_id_txt and Path(order_id_txt).exists():
+                    try:
+                        with open(order_id_txt, 'r', encoding='utf-8') as f:
+                            lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+                        if lines:
+                            _send_order_ids_to_api(lines, log_cb)
+                    except Exception as e:
+                        log_cb(f'  ⚠ Lỗi đọc Order ID để gửi API: {e}', 'warn')
+            else:
+                log_cb('  ℹ Bỏ qua gửi Order ID (đã tắt trong tab Test)', 'dim')
         return results
-    except Exception as e: log_cb(f'  ✗ Lỗi: {e}', 'err'); return []
+    except Exception as e:
+        import traceback
+        log_cb(f'  ✗ Lỗi: {e}', 'err')
+        log_cb(f'  📋 Traceback: {traceback.format_exc()}', 'dim')
+        return []
 
 # ═══════════════════════════════════════════════════════════════
 # WORKER & PRINTING FUNCTIONS
@@ -916,17 +924,10 @@ class AutomationWorker(QObject):
                         fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
                         if fp and Path(fp).exists():
                             try:
-                                for copy_num in [1, 2]:
-                                    if self._stop_event.is_set():
-                                        self.log_message.emit('warn', '⏹ Đã dừng in báo cáo.');
-                                        break
-                                    self.log_message.emit('info', f'  🖨️ In bản {copy_num}/2: {Path(fp).name}')
-                                    _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                                log_cb=lambda m, t='': self.log_message.emit(t, m))
-                                    if copy_num == 1:
-                                        import time as _t3; _t3.sleep(2)
-                                if not self._stop_event.is_set():
-                                    self.log_message.emit('ok', f'  ✓ Đã in báo cáo 2 bản: {Path(fp).name}')
+                                self.log_message.emit('info', f'  🖨️ In báo cáo: {Path(fp).name}')
+                                _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                            log_cb=lambda m, t='': self.log_message.emit(t, m))
+                                self.log_message.emit('ok', f'  ✓ Đã in báo cáo: {Path(fp).name}')
                             except Exception as e:
                                 self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
 
@@ -2110,6 +2111,15 @@ class App(QMainWindow):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
 
+        # ── Checkbox gửi Order ID lên API ──
+        api_row = QHBoxLayout()
+        self._test_send_api_cb = QCheckBox("📤 Gửi Order ID lên API")
+        self._test_send_api_cb.setChecked(True)
+        self._test_send_api_cb.setCursor(Qt.PointingHandCursor)
+        api_row.addWidget(self._test_send_api_cb)
+        api_row.addStretch()
+        layout.addLayout(api_row)
+
         # ── Group 1: Tính toán từ Picking list ──
         gb1 = QGroupBox("📊 Tính toán từ Picking list có sẵn")
         gb1_layout = QVBoxLayout(gb1)
@@ -2244,7 +2254,8 @@ class App(QMainWindow):
             self._test_log.emit("info", "🧪 TEST: Bắt đầu tính toán...")
             try:
                 results = run_calculator(pdfs, out_dir, master, retail, template,
-                                         lambda m, t='': self._test_log.emit(t, m))
+                                         lambda m, t='': self._test_log.emit(t, m),
+                                         send_order_ids=self._test_send_api_cb.isChecked())
                 for r in results:
                     self._test_log.emit("ok", f"  ✓ {r['rows']} SKU | Qty={r['tong_qty']} | Sold={r['tong_sold']} | Promo={r['tong_promo']}")
                     for key, lbl in [('xlsx_report', '📊')]:
@@ -2355,7 +2366,8 @@ class App(QMainWindow):
                     try:
                         results = run_calculator(groups['picking'], out_dir, master, retail, self._template_real,
                                                  lambda m, t='': self._test_log.emit(t, m),
-                                                 carrier=carrier)
+                                                 carrier=carrier,
+                                                 send_order_ids=self._test_send_api_cb.isChecked())
                         for r in results:
                             self._test_log.emit("ok", f"  ✓ {r['rows']} SKU | Qty={r['tong_qty']}")
                             fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
@@ -2363,13 +2375,10 @@ class App(QMainWindow):
                                 self._add_result(fp)
                                 if do_print:
                                     try:
-                                        for copy_num in [1, 2]:
-                                            self._test_log.emit("info", f"  🖨️ In bản {copy_num}/2: {Path(fp).name}")
-                                            _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                                        log_cb=lambda m, t='': self._test_log.emit(t, m))
-                                            if copy_num == 1:
-                                                import time as _t3; _t3.sleep(2)
-                                        self._test_log.emit("ok", f"  🖨️ Báo cáo 2 bản: {Path(fp).name}")
+                                        self._test_log.emit("info", f"  🖨️ In báo cáo: {Path(fp).name}")
+                                        _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                                    log_cb=lambda m, t='': self._test_log.emit(t, m))
+                                        self._test_log.emit("ok", f"  🖨️ Báo cáo: {Path(fp).name}")
                                     except Exception as e:
                                         self._test_log.emit("err", f"  ✗ Lỗi in báo cáo: {e}")
                     except Exception as e:
@@ -2466,7 +2475,7 @@ class App(QMainWindow):
                 f"Thư mục hôm nay chưa tồn tại:\n{today_dir}")
             return
 
-        xlsx_files = sorted(today_dir.glob("Phieu_xuat_hang_*.xlsx"))
+        xlsx_files = sorted(today_dir.glob("**/Phieu_xuat_hang_*.xlsx"))
         if not xlsx_files:
             QMessageBox.information(self, "Thông báo",
                 f"Không tìm thấy file Phieu_xuat_hang_*.xlsx nào trong:\n{today_dir}")
@@ -2862,7 +2871,12 @@ class App(QMainWindow):
         base = self.output_row.get_real_path() or str(BASE_DIR / "outputs")
         d = Path(base) / datetime.now().strftime("%Y-%m-%d")
         if d.exists():
-            os.startfile(str(d))
+            # Mở thư mục con mới nhất (theo giờ) nếu có
+            subdirs = sorted([p for p in d.iterdir() if p.is_dir()], reverse=True)
+            if subdirs:
+                os.startfile(str(subdirs[0]))
+            else:
+                os.startfile(str(d))
         elif Path(base).exists():
             os.startfile(base)
 
@@ -2880,12 +2894,14 @@ class App(QMainWindow):
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn ít nhất 1 hãng vận chuyển để in.")
             return
 
-        # ── Tính output_dir với date subfolder ──
+        # ── Tính output_dir với date + time subfolder ──
         base_dir = config['output_dir']
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        out_dir = str(Path(base_dir) / today_str)
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+        time_str = now.strftime('%H-%M-%S')
+        out_dir = str(Path(base_dir) / today_str / time_str)
         os.makedirs(out_dir, exist_ok=True)
-        config['output_dir'] = out_dir  # Ghi đè = path có ngày
+        config['output_dir'] = out_dir  # Ghi đè = path có ngày + giờ
 
         self.running = True
         self._set_buttons("running")
