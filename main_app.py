@@ -27,8 +27,6 @@ from PySide6.QtGui import (
     QFont, QTextCursor,
 )
 
-from playwright.sync_api import sync_playwright
-
 # ═══════════════════════════════════════════════════════════
 # Paths & config
 # ═══════════════════════════════════════════════════════════
@@ -36,13 +34,6 @@ BASE_DIR = Path(__file__).parent
 BILL_DIR = BASE_DIR / 'bill_calculate'
 UPLOAD_DIR = BILL_DIR / 'uploads'
 sys.path.insert(0, str(BILL_DIR))
-
-try:
-    from calculator import process_all, extract_report_data, aggregate_reports
-except ImportError:
-    process_all = None
-    extract_report_data = None
-    aggregate_reports = None
 
 # ═══════════════════════════════════════════════════════════
 # Frozen / source mode — detect paths
@@ -64,14 +55,15 @@ else:
 TARGET_URL = 'https://seller-vn.tiktok.com'
 ORDERS_URL = 'https://seller-vn.tiktok.com/order?order_status%5B%5D=1&selected_sort=11&tab=to_ship&page_size=50'
 CARRIER_URLS = {
-    'J&T':           ORDERS_URL + '&shipping_provider_id%5B%5D=6841743441349706241',
     'GHN':           ORDERS_URL + '&shipping_provider_id%5B%5D=7252807945006614278',
+    'J&T':           ORDERS_URL + '&shipping_provider_id%5B%5D=6841743441349706241',
     'VietNam Post':  ORDERS_URL + '&shipping_provider_id%5B%5D=7062208235196909313',
     'Best Express':  ORDERS_URL + '&shipping_provider_id%5B%5D=7099655686241388293',
     'Viettel Post':  ORDERS_URL + '&shipping_provider_id%5B%5D=7155825439565416197',
     'J&T Cargo VN':  ORDERS_URL + '&shipping_provider_id%5B%5D=7581675938962736917',
 }
 BATCH_SIZE = 50
+API_IDS_URL = 'http://88.2.0.55:7016/api/ids/receive'  # Endpoint nhận Order ID
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
@@ -201,6 +193,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 
     if not browser_ok:
         try:
+            from playwright.sync_api import sync_playwright  # Lazy import — chỉ load khi chạy automation
             playwright = sync_playwright().start()
             launch_opts = {'headless': False, 'channel': 'chrome', 'args': ['--disable-blink-features=AutomationControlled']}
             log_cb('🌐 Dùng Google Chrome có sẵn trên máy', 'info')
@@ -514,6 +507,10 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                                         continue
                                     if 'do not combine' in txt:
                                         continue
+                                    if 'kết hợp' in txt and 'không' not in txt:
+                                        continue  # Bỏ qua nút "chấp nhận tất cả X kết hợp và tiếp tục"
+                                    if 'combine' in txt and 'without' not in txt and 'do not' not in txt:
+                                        continue  # Bỏ qua nút "accept all X combinations and continue"
                                     if 'tiếp theo' in txt or 'next' in txt:
                                         continue
                                     if sel_text.lower() in txt:
@@ -727,10 +724,40 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
         return pdf_files, playwright, browser
 
 # ============================================================
+# SEND ORDER IDS TO API
+# ============================================================
+def _send_order_ids_to_api(order_ids, log_cb, url=None):
+    """Gửi danh sách Order ID đến API qua HTTP POST (text/plain)."""
+    if not order_ids:
+        return False
+    if url is None:
+        url = API_IDS_URL
+    try:
+        import urllib.request
+        body = ','.join(order_ids) + ','
+        data = body.encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'text/plain')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = resp.status
+            if 200 <= status < 300:
+                log_cb(f'  📤 Đã gửi {len(order_ids)} Order ID → API ({status})', 'ok')
+                return True
+            else:
+                log_cb(f'  ⚠ API trả về {status}', 'warn')
+                return False
+    except Exception as e:
+        log_cb(f'  ⚠ Lỗi gửi Order ID lên API: {e}', 'warn')
+        return False
+
+
+# ============================================================
 # CALCULATOR
 # ============================================================
 def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_path, log_cb, carrier=''):
-    if process_all is None:
+    try:
+        from calculator import process_all  # Lazy import — chỉ load khi chạy calculator
+    except ImportError:
         log_cb('✗ Calculator không khả dụng (thiếu module calculator)', 'err'); return []
     if not Path(master_path).exists(): log_cb(f'✗ Không tìm thấy master_data: {master_path}', 'err'); return []
     if not Path(template_path).exists(): log_cb(f'✗ Không tìm thấy template: {template_path}', 'err'); return []
@@ -744,6 +771,16 @@ def run_calculator(pdf_paths, output_dir, master_path, retail_path, template_pat
             for key, fb in r['files'].items():
                 src, dst = Path(fb), Path(out_dir) / Path(fb).name
                 if src != dst and src.exists(): shutil.copy2(str(src), str(dst)); r['files'][key] = str(dst)
+            # Gửi Order ID lên API nếu có
+            order_id_txt = r['files'].get('order_id_txt')
+            if order_id_txt and Path(order_id_txt).exists():
+                try:
+                    with open(order_id_txt, 'r', encoding='utf-8') as f:
+                        lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+                    if lines:
+                        _send_order_ids_to_api(lines, log_cb)
+                except Exception as e:
+                    log_cb(f'  ⚠ Lỗi đọc Order ID để gửi API: {e}', 'warn')
         return results
     except Exception as e: log_cb(f'  ✗ Lỗi: {e}', 'err'); return []
 
@@ -1742,7 +1779,7 @@ class App(QMainWindow):
         self.carrier_spinboxes = {}
         self.carrier_checkboxes = {}
         carriers = [
-            ("J&T Express:", "jt"), ("GHN:", "ghn"),
+            ("GHN:", "ghn"), ("J&T Express:", "jt"),
             ("VietNam Post:", "vnp"), ("Best Express:", "best"),
             ("Viettel Post:", "viettel"), ("J&T Cargo VN:", "jtc"),
         ]
@@ -2467,6 +2504,7 @@ class App(QMainWindow):
             for f in files:
                 self._ag_log("dim", f"  📄 {Path(f).name}")
             try:
+                from calculator import aggregate_reports  # Lazy import — chỉ load khi tổng hợp
                 result = aggregate_reports(files, out_dir, template)
                 self._ag_log("ok", f"  ✓ {result['rows']} SKU | Qty={result['tong_qty']} | "
                                     f"Sold={result['tong_sold']} | Promo={result['tong_promo']}")
@@ -2699,8 +2737,8 @@ class App(QMainWindow):
     # ═══════════════════════════════════════════════════════
     def _collect_config(self) -> dict:
         carriers_to_process = []
-        carrier_keys = ["jt", "ghn", "vnp", "best", "viettel", "jtc"]
-        carrier_names = ["J&T", "GHN", "VietNam Post", "Best Express", "Viettel Post", "J&T Cargo VN"]
+        carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
+        carrier_names = ["GHN", "J&T", "VietNam Post", "Best Express", "Viettel Post", "J&T Cargo VN"]
         for key, name in zip(carrier_keys, carrier_names):
             if self.carrier_checkboxes[key].isChecked():
                 val = self.carrier_spinboxes[key].value()
@@ -3051,7 +3089,7 @@ class App(QMainWindow):
     # ═══════════════════════════════════════════════════════
     def _save_config(self):
         """Lưu cấu hình hiện tại ra file JSON."""
-        carrier_keys = ["jt", "ghn", "vnp", "best", "viettel", "jtc"]
+        carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
         data = {
             'cookie': self._cookie_real,
             'master': self._master_real,

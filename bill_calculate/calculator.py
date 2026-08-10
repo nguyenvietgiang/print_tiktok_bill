@@ -217,10 +217,13 @@ def extract_order_counts(
     pattern = r'\b((?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:-)?)\s+(\d+)\s+(\d{15,})'
 
     counts: dict[str, int] = defaultdict(int)
+    order_ids: set[str] = set()  # Gom Order ID (15+ chu so)
 
     for match in re.finditer(pattern, flat_text):
         candidate = match.group(1)
         qty = int(match.group(2))
+        order_id = match.group(3)
+        order_ids.add(order_id)  # Gom Order ID
 
         if candidate in master_skus:
             # Exact match: Seller SKU xuat hien day du trong PDF
@@ -254,6 +257,7 @@ def extract_order_counts(
             print(f"   ⚠ SKU la: {candidate} (x{qty}) - khong co trong ca 2 file")
 
     header_info = _parse_pdf_header(full_text)
+    header_info['order_ids'] = order_ids  # Lưu lại để xuất ra file
     return dict(counts), header_info
 
 
@@ -949,6 +953,7 @@ def process_all(
     from collections import defaultdict
     merged_order_counts: dict[str, int] = defaultdict(int)
     total_order_qty = 0   # Số đơn hàng thực tế (Order quantity từ header)
+    all_order_ids: set[str] = set()  # Gom tất cả Order ID
 
     for pdf_path in pdf_files:
         print(f"\nXu ly: {os.path.basename(pdf_path)}")
@@ -960,6 +965,9 @@ def process_all(
             merged_order_counts[sku] += count
         order_qty = header_info.get('order_qty', 0)
         total_order_qty += order_qty
+        # Gom Order ID
+        if header_info.get('order_ids'):
+            all_order_ids.update(header_info['order_ids'])
         print(f"   Tim thay {len(order_counts)} Seller SKU, {order_qty} don hang (header), {sum(order_counts.values())} mat hang")
 
     if not merged_order_counts:
@@ -981,6 +989,18 @@ def process_all(
 
     fill_template(results, template_path, output_path, carrier=carrier, order_count=total_order_qty)
 
+    # ── Lưu danh sách Order ID ra file .txt ──
+    if all_order_ids:
+        order_id_path = os.path.join(output_dir, f"{prefix}Order_ID_{now.strftime('%m-%d_%H-%M-%S')}.txt")
+        with open(order_id_path, 'w', encoding='utf-8') as f:
+            f.write(f"# Order ID — {carrier or 'tat ca'} — {now.strftime('%d/%m/%Y %H:%M:%S')}\n")
+            f.write(f"# Tong: {len(all_order_ids)} Order ID\n")
+            f.write(f"# SL don: {total_order_qty}\n")
+            f.write(f"# SL mat hang: {sum(merged_order_counts.values())}\n\n")
+            for oid in sorted(all_order_ids):
+                f.write(oid + '\n')
+        print(f"   📋 Đã lưu {len(all_order_ids)} Order ID → {os.path.basename(order_id_path)}")
+
     # ── Xuất PDF từ file Excel vừa tạo ──
     pdf_path = ''
     try:
@@ -991,6 +1011,8 @@ def process_all(
     files_dict = {"xlsx_report": output_path}
     if pdf_path:
         files_dict["pdf_report"] = pdf_path
+    if all_order_ids:
+        files_dict["order_id_txt"] = order_id_path
 
     return [{
         "base_name": f"Combined {carrier or 'all'}",
