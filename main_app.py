@@ -71,7 +71,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ============================================================
 # AUTOMATION
 # ============================================================
-def _detect_captcha(page, log_cb, state_cb, stop_event):
+def _detect_captcha(page, log_cb, state_cb, stop_event, output_dir=''):
     """Kiểm tra xem TikTok có hiện CAPTCHA không. Nếu có → dừng chờ user giải."""
     captcha_selectors = [
         # TikTok slider CAPTCHA
@@ -102,7 +102,8 @@ def _detect_captcha(page, log_cb, state_cb, stop_event):
                 state_cb('captcha', '⏳ Đợi bạn giải CAPTCHA...')
                 # Chụp màn hình
                 try:
-                    ss = f'captcha_{datetime.now().strftime("%m-%d_%H-%M-%S")}.png'
+                    ss_dir = output_dir if output_dir else '.'
+                    ss = str(Path(ss_dir) / f'captcha_{datetime.now().strftime("%m-%d_%H-%M-%S")}.png')
                     page.screenshot(path=ss)
                     log_cb(f'  📸 Screenshot: {ss}', 'info')
                 except: pass
@@ -176,7 +177,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         pass
             page.goto(orders_url, wait_until='networkidle', timeout=60000)
             page.wait_for_timeout(4000)
-            _detect_captcha(page, log_cb, state_cb, stop_event)
+            _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
             browser_ok = True
         except Exception as e:
             log_cb(f'⚠ Không dùng lại được browser cũ ({e}) — tạo mới...', 'warn')
@@ -193,6 +194,18 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             existing_playwright = None
 
     if not browser_ok:
+        # ── Stop playwright cũ TRƯỚC KHI tạo mới ──
+        # Nếu không stop, sync_playwright().start() sẽ phát hiện event loop cũ
+        # còn chạy và ném lỗi: "using Playwright Sync API inside the asyncio loop"
+        if existing_playwright is not None:
+            try:
+                existing_playwright.stop()
+            except Exception:
+                pass
+            existing_playwright = None
+            import time as _time_stop
+            _time_stop.sleep(0.3)  # Đợi event loop cũ thoát hẳn
+
         try:
             from playwright.sync_api import sync_playwright  # Lazy import — chỉ load khi chạy automation
             playwright = sync_playwright().start()
@@ -219,7 +232,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
         page = context.new_page()
         page.goto(TARGET_URL, wait_until='domcontentloaded', timeout=30000)
         page.wait_for_timeout(2000)
-        _detect_captcha(page, log_cb, state_cb, stop_event)
+        _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
 
     try:
         while total_printed < target:
@@ -244,13 +257,17 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         log_cb(f'  ✗ Thất bại sau {MAX_GOTO_RETRIES} lần thử: {e}', 'err')
                         raise
             page.wait_for_timeout(4000)
-            _detect_captcha(page, log_cb, state_cb, stop_event)
+            _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
 
             total_avail = page.evaluate("() => document.querySelectorAll('td.col-checkbox label.p-checkbox').length")
             if total_avail == 0:
                 # Kiểm tra có phải do chưa đăng nhập hay thực sự hết đơn
                 try:
                     is_logged_out = page.evaluate("""() => {
+                        // Check API-based session: page title contains login
+                        if (document.title && document.title.toLowerCase().includes('login')) {
+                            return true;
+                        }
                         return (document.querySelector('input[name="email"]') !== null ||
                                 document.querySelector('input[type="email"]') !== null ||
                                 window.location.href.includes('login') ||
@@ -382,6 +399,10 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                         force_stop = False
                         log_cb(f'  🔄 "Chọn X đầu tiên" → còn đơn, chạy batch tiếp', 'info')
                     select_all_batches += 1
+                    # ── Safety limit: tránh loop vô hạn nếu TikTok thay đổi UI ──
+                    if select_all_batches > 20:
+                        log_cb('  ⚠ Đã chạy 20 batch "Chọn tất cả" — dừng để tránh loop vô hạn', 'warn')
+                        force_stop = True
                 else:
                     # ✅ Case 1: KHÔNG có nút "Chọn tất cả" → chỉ có đúng ≤20 đơn thật
                     checked = header_checked
@@ -736,6 +757,8 @@ def _send_order_ids_to_api(order_ids, log_cb, url=None):
     try:
         import urllib.request
         body = ','.join(order_ids) + ','
+        # Đảm bảo không có dấu phẩy kép nếu danh sách rỗng
+        body = body if body != ',' else ''
         data = body.encode('utf-8')
         req = urllib.request.Request(url, data=data, method='POST')
         req.add_header('Content-Type', 'text/plain')
@@ -998,7 +1021,30 @@ def _find_foxit_exe():
     foxit_paths = [
         r'C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
         r'C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe',
+        r'C:\Program Files (x86)\Foxit Software\Foxit PhantomPDF\FoxitPhantomPDF.exe',
+        r'C:\Program Files\Foxit Software\Foxit PhantomPDF\FoxitPhantomPDF.exe',
     ]
+    # Tìm thêm trong thư mục con của Foxit Software (1 cấp)
+    for base in [r'C:\Program Files (x86)\Foxit Software', r'C:\Program Files\Foxit Software']:
+        try:
+            if os.path.isdir(base):
+                # Quét file trực tiếp trong base
+                for f in os.listdir(base):
+                    fp_full = os.path.join(base, f)
+                    if os.path.isfile(fp_full) and f.lower().startswith('foxit') and f.lower().endswith('.exe'):
+                        foxit_paths.append(fp_full)
+                # Quét 1 cấp thư mục con
+                for sub in os.listdir(base):
+                    sub_path = os.path.join(base, sub)
+                    if os.path.isdir(sub_path):
+                        try:
+                            for f in os.listdir(sub_path):
+                                if f.lower().startswith('foxit') and f.lower().endswith('.exe'):
+                                    foxit_paths.append(os.path.join(sub_path, f))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     for fp in foxit_paths:
         if Path(fp).exists():
             _foxit_exe_cache = fp
@@ -1021,7 +1067,7 @@ def _check_print_errors(printer_name, doc_name_hint='', log_cb=None, timeout=60)
         __import__('time').sleep(5)
         result = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
             f"$jobs = Get-PrintJob -PrinterName '{printer_name}' -ErrorAction SilentlyContinue"
-            + (f" | Where-Object {{ $_.DocumentName -like '*{doc_name_hint[:30]}*' }}" if doc_name_hint else "")
+            + (f" | Where-Object {{ $_.DocumentName -like '*{doc_name_hint[:30].replace(chr(39), '').replace(chr(34), '')}*' }}" if doc_name_hint else "")
             + " | Select-Object JobStatus | ConvertTo-Json -Compress"
         ], capture_output=True, text=True,
            creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
@@ -1187,36 +1233,38 @@ def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, b
                     _check_print_errors(printer_name, doc_name_hint=os.path.basename(print_path), log_cb=log_cb)
                     if log_cb: log_cb(f'  ✅ In hoàn tất', 'ok')
             if temp_merged:
-                def _cleanup(p=temp_merged):
-                    import time; time.sleep(5)
-                    try: _os.remove(p)
-                    except: pass
-                threading.Timer(5, _cleanup).start()
+                try:
+                    _os.remove(temp_merged)
+                    if log_cb: log_cb(f'  🗑 Đã xóa file tạm merge 2-up', 'dim')
+                except Exception:
+                    pass
             return
 
         if fp.lower().endswith('.xlsx') or fp.lower().endswith('.xls'):
+            import pythoncom, win32com.client, time as _t_excel
+            pythoncom.CoInitialize()
+            excel = None
             try:
-                import pythoncom, win32com.client, time as _t_excel
                 # Đợi queue trống + delay cứng để đảm bảo 2 job không bị gộp
                 _wait_print_queue(printer_name)
                 _t_excel.sleep(1)
-                pythoncom.CoInitialize()
                 excel = win32com.client.Dispatch("Excel.Application")
                 excel.Visible = False
                 workbook = excel.Workbooks.Open(_os.path.abspath(fp))
                 workbook.PrintOut(ActivePrinter=printer_name, FitToPagesWide=1, FitToPagesTall=False)
                 # Đợi Excel spool xong job ra queue rồi mới đóng
                 _t_excel.sleep(2)
-                workbook.Close(False); excel.Quit(); pythoncom.CoUninitialize()
-                # Đợi job đã chắc chắn vào queue
-                _t_excel.sleep(1)
-                return
-            except Exception:
-                try: pythoncom.CoUninitialize()
+                workbook.Close(False)
+            finally:
+                try:
+                    if excel: excel.Quit()
                 except: pass
-            raise RuntimeError(
-                'Không thể in file Excel. Máy cần cài Microsoft Excel.'
-            )
+                try:
+                    pythoncom.CoUninitialize()
+                except: pass
+            # Đợi job đã chắc chắn vào queue
+            _t_excel.sleep(1)
+            return
     except Exception:
         raise
 
@@ -3079,10 +3127,12 @@ class App(QMainWindow):
             self._log_html("warn", "⏭ Bỏ qua chu kỳ — không có hãng nào được chọn")
             return
 
-        # ── Tính output_dir với date subfolder ──
+        # ── Tính output_dir với date + time subfolder ──
         base_dir = config['output_dir']
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        out_dir = str(Path(base_dir) / today_str)
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+        time_str = now.strftime('%H-%M-%S')
+        out_dir = str(Path(base_dir) / today_str / time_str)
         os.makedirs(out_dir, exist_ok=True)
         config['output_dir'] = out_dir
 

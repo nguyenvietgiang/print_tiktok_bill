@@ -209,15 +209,41 @@ def extract_order_counts(
                 texts.append(t)
     full_text = "\n".join(texts)
 
+    counts: dict[str, int] = defaultdict(int)
+    order_ids: set[str] = set()
+
+    # ── Phát hiện Shipping Label PDF: mỗi trang có "Order ID: XXX" rõ ràng ──
+    # Picking List cũng có chữ "Order ID" trong cột header → phải loại trừ
+    is_shipping_label = ('Order ID:' in full_text
+                         and 'Picking List' not in full_text
+                         and 'Picking list' not in full_text)
+
+    if is_shipping_label:
+        # Trích xuất Order ID từ Shipping Label (dễ, chính xác 100%)
+        for t in texts:
+            for m in re.finditer(r'Order ID:\s*([A-Za-z0-9]+)', t):
+                order_ids.add(m.group(1))
+        # Vẫn trích xuất SKU từ Shipping Label nếu có
+        for t in texts:
+            for m in re.finditer(r'(?:Seller SKU|SKU)\s+([A-Za-z0-9-]+)\s+(\d+)', t):
+                sku = m.group(1)
+                qty = int(m.group(2))
+                if sku in master_skus:
+                    counts[sku] += qty
+                elif retail_lookup and sku in retail_lookup:
+                    counts[sku] += qty
+
+        header_info = _parse_pdf_header(full_text)
+        header_info['order_ids'] = order_ids
+        return dict(counts), header_info
+
+    # ── Picking List: xử lý phức tạp hơn ──
     # Gộp các dòng để xử lý SKU ngắt dòng (thay \n = space)
     flat_text = full_text.replace('\n', ' ')
 
     # Pattern: Mã SKU (chứa ít nhất 1 chữ cái, có thể bắt đầu bằng số, có thể kết thúc bằng - nếu bị ngắt)
-    #           + Qty (số đơn hàng) + OrderID (15+ chữ số)
-    pattern = r'\b((?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:-)?)\s+(\d+)\s+(\d{15,})'
-
-    counts: dict[str, int] = defaultdict(int)
-    order_ids: set[str] = set()  # Gom Order ID (15+ chu so)
+    #           + Qty (số đơn hàng) + OrderID (15+ chữ số HOẶC 12+ ký tự alphanumeric)
+    pattern = r'\b((?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:-)?)\s+(\d+)\s+([A-Za-z0-9]{12,})'
 
     for match in re.finditer(pattern, flat_text):
         candidate = match.group(1)
@@ -258,6 +284,18 @@ def extract_order_counts(
 
     header_info = _parse_pdf_header(full_text)
     header_info['order_ids'] = order_ids  # Lưu lại để xuất ra file
+
+    # ── Pass 2: Bắt thêm Order ID rời (nằm riêng trên dòng khác, không có SKU+Qty đi kèm) ──
+    # PDF có thể liệt kê nhiều Order ID dưới cùng 1 SKU, mỗi ID 1 dòng
+    standalone_pattern = r'\b([A-Za-z0-9]{12,})\b'
+    for match in re.finditer(standalone_pattern, full_text):
+        oid = match.group(1)
+        # Chỉ thêm nếu giống Order ID (có chữ + số, hoặc toàn số 15+ ký tự)
+        if oid.isdigit() and len(oid) >= 15:
+            order_ids.add(oid)
+        elif not oid.isdigit() and any(c.isdigit() for c in oid) and any(c.isalpha() for c in oid):
+            order_ids.add(oid)
+
     return dict(counts), header_info
 
 
@@ -750,11 +788,16 @@ def fill_template(
     # ── Panel trái: cột B (SKU), cột E (SL), F (SL bán), G (SL KM) ──
     matched_skus: set[str] = set()
     filled_left = 0
+    empty_streak = 0
     for row_idx in range(3, ws.max_row + 1):
         sku_cell = ws.cell(row=row_idx, column=2)  # Cột B
         sku_code = str(sku_cell.value).strip() if sku_cell.value else ''
         if not sku_code:
+            empty_streak += 1
+            if empty_streak > 50:  # Quá 50 dòng trống liên tiếp → dừng (tránh max_row ảo)
+                break
             continue
+        empty_streak = 0
         qty_info = find_qty(sku_code)
         if qty_info:
             ws.cell(row=row_idx, column=5, value=qty_info["qty"])       # SL
@@ -765,11 +808,16 @@ def fill_template(
 
     # ── Panel phải: cột I (SKU), cột L (SL), M (SL bán), N (SL KM) ──
     filled_right = 0
+    empty_streak = 0
     for row_idx in range(3, ws.max_row + 1):
         sku_cell = ws.cell(row=row_idx, column=9)  # Cột I
         sku_code = str(sku_cell.value).strip() if sku_cell.value else ''
         if not sku_code:
+            empty_streak += 1
+            if empty_streak > 50:  # Quá 50 dòng trống liên tiếp → dừng
+                break
             continue
+        empty_streak = 0
         qty_info = find_qty(sku_code)
         if qty_info:
             ws.cell(row=row_idx, column=12, value=qty_info["qty"])       # SL
