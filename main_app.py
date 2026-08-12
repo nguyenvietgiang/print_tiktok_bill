@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QCheckBox, QRadioButton,
     QButtonGroup, QSpinBox, QComboBox, QTextEdit, QListWidget,
-    QListWidgetItem, QScrollArea, QStackedWidget, QTableWidget,
+    QListWidgetItem, QScrollArea, QStackedWidget, QTableWidget, QTabWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QFrame, QApplication,
 )
@@ -1465,16 +1465,21 @@ class App(QMainWindow):
 
         self._sched_mode = "weekly"
         self._sched_interval_hours = 1
-        self._sched_weekly_config: dict[int, list[tuple[int, int]]] = {}  # 0=Thứ 2..6=Chủ Nhật
+        self._sched_weekly_config: dict[str, dict[int, list[tuple[int, int]]]] = {}  # {"": {day_idx: [(h,m)]}, "ghn": {...}, ...}
+        self._sched_carrier_custom: dict[str, bool] = {}  # {"ghn": True, "jt": False, ...} — carrier nào dùng lịch riêng
         self._sched_next_run = None
         self._sched_last_run = None
 
         # Weekly scheduler widget refs (assigned in _build_schedule_tab)
         self.weekly_rb = None
         self.weekly_panel = None
-        self.weekly_day_checkboxes: dict[int, QCheckBox] = {}
-        self.weekly_day_time_edits: dict[int, QLineEdit] = {}
+        self.weekly_day_checkboxes: dict[int, QCheckBox] = {}  # Tab "Tất cả"
+        self.weekly_day_time_edits: dict[int, QLineEdit] = {}  # Tab "Tất cả"
         self.weekly_master_time_edit = None
+        # Per-carrier schedule widgets
+        self._carrier_day_checkboxes: dict[str, dict[int, QCheckBox]] = {}  # {"ghn": {0: cb, 1: cb, ...}, ...}
+        self._carrier_day_time_edits: dict[str, dict[int, QLineEdit]] = {}  # {"ghn": {0: te, 1: te, ...}, ...}
+        self._carrier_use_custom_cb: dict[str, QCheckBox] = {}  # {"ghn": cb, ...} — checkbox "Dùng lịch riêng"
 
         self._worker_thread = QThread()
         self._worker = AutomationWorker()
@@ -2017,7 +2022,7 @@ class App(QMainWindow):
         self.sched_button_group.addButton(self.weekly_rb)
         gb_layout.addWidget(self.weekly_rb)
 
-        # Weekly sub-panel — mỗi ngày trong tuần có checkbox + khung giờ riêng
+        # Weekly sub-panel — QTabWidget: "Tất cả" + mỗi carrier 1 tab
         self.weekly_panel = QWidget()
         wp_outer = QVBoxLayout(self.weekly_panel)
         wp_outer.setContentsMargins(32, 0, 0, 0)
@@ -2046,32 +2051,87 @@ class App(QMainWindow):
         sep.setStyleSheet("color: #E2E8F0; max-height: 1px;")
         wp_outer.addWidget(sep)
 
-        # 7 day rows in a vertical layout
+        # ── QTabWidget: "Tất cả" + 6 carrier tabs ──
+        self._sched_tab_widget = QTabWidget()
+        self._sched_tab_widget.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #E2E8F0; border-radius: 0 6px 6px 6px; background: #FFFFFF; }
+            QTabBar::tab { padding: 6px 14px; border: 1px solid #E2E8F0; border-bottom: none; border-radius: 6px 6px 0 0; margin-right: 2px; background: #F8FAFC; }
+            QTabBar::tab:selected { background: #FFFFFF; font-weight: bold; color: #2563EB; }
+        """)
+
         day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
-        for idx, name in enumerate(day_names):
-            day_row = QHBoxLayout()
-            day_row.setSpacing(8)
+        default_times = {idx: "07:30, 13:20, 15:10, 16:10, 17:10, 18:10" if idx < 6 else "" for idx in range(7)}
 
-            cb = QCheckBox(name)
-            cb.setFixedWidth(90)
-            cb.setChecked(idx < 6)  # Mặc định T2-T7 checked, CN unchecked
-            cb.setStyleSheet("font-weight: 500;")
-            self.weekly_day_checkboxes[idx] = cb
+        def _build_day_rows(parent_widget, cb_dict, te_dict, default_enabled=True):
+            """Tạo 7 day rows cho 1 tab. Trả về layout chứa các rows."""
+            day_layout = QVBoxLayout()
+            day_layout.setSpacing(6)
+            for idx, name in enumerate(day_names):
+                day_row = QHBoxLayout()
+                day_row.setSpacing(8)
 
-            te = QLineEdit("07:30, 13:20, 15:10, 16:10, 17:10, 18:10" if idx < 6 else "")
-            te.setFixedWidth(220)
-            te.setEnabled(idx < 6)
-            te.setPlaceholderText("VD: 07:30, 13:20, 15:10")
-            self.weekly_day_time_edits[idx] = te
+                cb = QCheckBox(name)
+                cb.setFixedWidth(90)
+                cb.setChecked(idx < 6 and default_enabled)
+                cb.setStyleSheet("font-weight: 500;")
+                cb_dict[idx] = cb
 
-            # Checkbox toggle -> enable/disable time edit
-            cb.toggled.connect(lambda checked, i=idx: self.weekly_day_time_edits[i].setEnabled(checked))
+                te = QLineEdit(default_times[idx] if default_enabled else "")
+                te.setFixedWidth(220)
+                te.setEnabled(idx < 6 and default_enabled)
+                te.setPlaceholderText("VD: 07:30, 13:20, 15:10")
+                te_dict[idx] = te
 
-            day_row.addWidget(cb)
-            day_row.addWidget(te)
-            day_row.addStretch()
-            wp_outer.addLayout(day_row)
+                cb.toggled.connect(lambda checked, i=idx, t=te: t.setEnabled(checked))
 
+                day_row.addWidget(cb)
+                day_row.addWidget(te)
+                day_row.addStretch()
+                day_layout.addLayout(day_row)
+            day_layout.addStretch()
+            return day_layout
+
+        # ── Tab 0: "📦 Tất cả" (global schedule) ──
+        global_tab = QWidget()
+        global_layout = _build_day_rows(global_tab, self.weekly_day_checkboxes, self.weekly_day_time_edits, default_enabled=True)
+        global_tab.setLayout(global_layout)
+        self._sched_tab_widget.addTab(global_tab, "📦 Tất cả")
+
+        # ── Tab 1-6: mỗi carrier 1 tab ──
+        carrier_labels = [("GHN", "ghn"), ("J&T", "jt"), ("VietNam Post", "vnp"),
+                          ("Best Express", "best"), ("Viettel Post", "viettel"), ("J&T Cargo", "jtc")]
+        for c_label, c_key in carrier_labels:
+            carrier_tab = QWidget()
+            c_outer = QVBoxLayout(carrier_tab)
+            c_outer.setContentsMargins(8, 8, 8, 8)
+            c_outer.setSpacing(8)
+
+            # Checkbox "Dùng lịch riêng"
+            use_custom_cb = QCheckBox(f"🕐 Dùng lịch riêng cho {c_label}")
+            use_custom_cb.setStyleSheet("font-weight: bold; color: #D97706;")
+            self._carrier_use_custom_cb[c_key] = use_custom_cb
+            c_outer.addWidget(use_custom_cb)
+
+            # Day rows — disabled by default, enabled when checkbox checked
+            cb_dict: dict[int, QCheckBox] = {}
+            te_dict: dict[int, QLineEdit] = {}
+            day_rows_layout = _build_day_rows(carrier_tab, cb_dict, te_dict, default_enabled=False)
+            self._carrier_day_checkboxes[c_key] = cb_dict
+            self._carrier_day_time_edits[c_key] = te_dict
+
+            # Wrap day rows in a QWidget so we can enable/disable them
+            day_rows_widget = QWidget()
+            day_rows_widget.setLayout(day_rows_layout)
+            day_rows_widget.setEnabled(False)
+            c_outer.addWidget(day_rows_widget)
+
+            # Connect checkbox → enable/disable day rows + copy global template
+            use_custom_cb.toggled.connect(lambda checked, w=day_rows_widget, ck=c_key: self._on_carrier_custom_toggled(checked, w, ck))
+            c_outer.addStretch()
+
+            self._sched_tab_widget.addTab(carrier_tab, c_label)
+
+        wp_outer.addWidget(self._sched_tab_widget)
         wp_outer.addStretch()
         self.weekly_panel.show()
         gb_layout.addWidget(self.weekly_panel)
@@ -2792,12 +2852,15 @@ class App(QMainWindow):
     # ═══════════════════════════════════════════════════════
     # CONFIG COLLECTOR
     # ═══════════════════════════════════════════════════════
-    def _collect_config(self) -> dict:
+    def _collect_config(self, carrier_filter=None) -> dict:
+        """Thu thập cấu hình từ UI. Nếu carrier_filter được cung cấp, chỉ include carrier trong filter."""
         carriers_to_process = []
         carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
         carrier_names = ["GHN", "J&T", "VietNam Post", "Best Express", "Viettel Post", "J&T Cargo VN"]
         for key, name in zip(carrier_keys, carrier_names):
             if self.carrier_checkboxes[key].isChecked():
+                if carrier_filter is not None and name not in carrier_filter:
+                    continue  # Skip carrier không nằm trong filter
                 val = self.carrier_spinboxes[key].value()
                 carriers_to_process.append((name, val))
             # unchecked = bỏ qua hãng này hoàn toàn
@@ -2959,6 +3022,30 @@ class App(QMainWindow):
         self.status_label.setStyleSheet("color: #D97706; font-weight: bold; font-size: 14px;")
         self.trigger_job.emit(config)
 
+    def _parse_weekly_times(day_checkboxes, day_time_edits, day_names):
+        """Parse time strings from day rows. Returns {day_idx: [(h, m), ...]} or None if error."""
+        result = {}
+        for idx in range(7):
+            if not day_checkboxes[idx].isChecked():
+                continue
+            time_text = day_time_edits[idx].text().strip()
+            if not time_text:
+                continue
+            parts = [t.strip() for t in time_text.split(",") if t.strip()]
+            parsed = []
+            for t in parts:
+                try:
+                    h, m = t.split(":")
+                    h_int, m_int = int(h), int(m)
+                    if not (0 <= h_int <= 23 and 0 <= m_int <= 59):
+                        raise ValueError
+                    parsed.append((h_int, m_int))
+                except (ValueError, TypeError):
+                    return None, f"Giờ không hợp lệ cho {day_names[idx]}: '{t}'. Nhập dạng HH:MM (0-23:0-59)."
+            if parsed:
+                result[idx] = sorted(parsed)
+        return result, None
+
     def _on_run_schedule(self):
         if not Path(self._cookie_real).exists():
             QMessageBox.critical(self, "Lỗi", "Chọn file cookie JSON hợp lệ.")
@@ -2968,40 +3055,41 @@ class App(QMainWindow):
             self._on_run_now()
             return
         if mode == "weekly":
-            # Parse per-day config
             day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
             self._sched_weekly_config = {}
+            self._sched_carrier_custom = {}
             has_any = False
 
-            for idx in range(7):
-                if not self.weekly_day_checkboxes[idx].isChecked():
-                    continue
+            # ── Parse global schedule ("Tất cả" tab) ──
+            global_config, err = _parse_weekly_times(self.weekly_day_checkboxes, self.weekly_day_time_edits, day_names)
+            if err:
+                QMessageBox.critical(self, "Lỗi", err)
+                return
+            self._sched_weekly_config[""] = global_config
+            if global_config:
+                has_any = True
 
-                time_text = self.weekly_day_time_edits[idx].text().strip()
-                if not time_text:
-                    continue  # checked but no times entered → skip silently
-
-                parts = [t.strip() for t in time_text.split(",") if t.strip()]
-                parsed = []
-                for t in parts:
-                    try:
-                        h, m = t.split(":")
-                        h_int, m_int = int(h), int(m)
-                        if not (0 <= h_int <= 23 and 0 <= m_int <= 59):
-                            raise ValueError
-                        parsed.append((h_int, m_int))
-                    except (ValueError, TypeError):
-                        QMessageBox.critical(self, "Lỗi",
-                            f"Giờ không hợp lệ cho {day_names[idx]}: '{t}'. Nhập dạng HH:MM (0-23:0-59).")
+            # ── Parse per-carrier schedules ──
+            carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
+            for c_key in carrier_keys:
+                use_custom = self._carrier_use_custom_cb.get(c_key) and self._carrier_use_custom_cb[c_key].isChecked()
+                self._sched_carrier_custom[c_key] = use_custom
+                if use_custom:
+                    carrier_config, err = _parse_weekly_times(
+                        self._carrier_day_checkboxes[c_key],
+                        self._carrier_day_time_edits[c_key],
+                        day_names)
+                    if err:
+                        carrier_names = {"ghn": "GHN", "jt": "J&T", "vnp": "VietNam Post", "best": "Best Express", "viettel": "Viettel Post", "jtc": "J&T Cargo"}
+                        QMessageBox.critical(self, "Lỗi", f"[{carrier_names.get(c_key, c_key)}] {err}")
                         return
-
-                if parsed:
-                    self._sched_weekly_config[idx] = sorted(parsed)
-                    has_any = True
+                    self._sched_weekly_config[c_key] = carrier_config
+                    if carrier_config:
+                        has_any = True
 
             if not has_any:
                 QMessageBox.critical(self, "Lỗi",
-                    "Vui lòng chọn ít nhất một ngày và nhập ít nhất một khung giờ.")
+                    "Vui lòng chọn ít nhất một ngày và nhập ít nhất một khung giờ (global hoặc carrier).")
                 return
         elif mode == "interval":
             self._sched_interval_hours = self.interval_spin.value()
@@ -3013,10 +3101,22 @@ class App(QMainWindow):
             self._log_html("info", f"   Chạy mỗi {self._sched_interval_hours} giờ")
         elif mode == "weekly":
             day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
-            for idx in range(7):
-                if idx in self._sched_weekly_config:
-                    times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in self._sched_weekly_config[idx])
-                    self._log_html("info", f"   {day_names[idx]}: {times_str}")
+            # Log global schedule
+            if self._sched_weekly_config.get(""):
+                self._log_html("info", "   📦 Lịch chung (Tất cả):")
+                for idx in range(7):
+                    if idx in self._sched_weekly_config[""]:
+                        times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in self._sched_weekly_config[""][idx])
+                        self._log_html("info", f"      {day_names[idx]}: {times_str}")
+            # Log per-carrier schedules
+            carrier_names = {"ghn": "GHN", "jt": "J&T", "vnp": "VietNam Post", "best": "Best Express", "viettel": "Viettel Post", "jtc": "J&T Cargo"}
+            for c_key in ["ghn", "jt", "vnp", "best", "viettel", "jtc"]:
+                if self._sched_carrier_custom.get(c_key) and self._sched_weekly_config.get(c_key):
+                    self._log_html("info", f"   🚚 {carrier_names[c_key]} (lịch riêng):")
+                    for idx in range(7):
+                        if idx in self._sched_weekly_config[c_key]:
+                            times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in self._sched_weekly_config[c_key][idx])
+                            self._log_html("info", f"      {day_names[idx]}: {times_str}")
 
         self._sched_mode = mode
         self.scheduler_active = True
@@ -3051,16 +3151,34 @@ class App(QMainWindow):
     # WEEKLY SCHEDULER HELPERS
     # ═══════════════════════════════════════════════════════
     def _on_weekly_apply_all(self):
-        """Copy nội dung ô giờ mẫu vào tất cả các ngày đang checked."""
+        """Copy nội dung ô giờ mẫu vào tất cả các ngày đang checked (global + carrier tabs đang bật lịch riêng)."""
         master_text = self.weekly_master_time_edit.text()
+        # Global tab
         for idx in range(7):
             if self.weekly_day_checkboxes[idx].isChecked():
                 self.weekly_day_time_edits[idx].setText(master_text)
+        # Carrier tabs — chỉ copy vào tab đang bật "Dùng lịch riêng"
+        for c_key in self._carrier_day_checkboxes:
+            if self._carrier_use_custom_cb.get(c_key) and self._carrier_use_custom_cb[c_key].isChecked():
+                for idx in range(7):
+                    if self._carrier_day_checkboxes[c_key][idx].isChecked():
+                        self._carrier_day_time_edits[c_key][idx].setText(master_text)
 
-    def _find_next_run_today(self, now: datetime) -> datetime | None:
-        """Tìm timeslot tiếp theo trong ngày hôm nay. Trả về None nếu hôm nay hết slot."""
+    def _on_carrier_custom_toggled(self, checked: bool, day_rows_widget, carrier_key: str):
+        """Khi bật/tắt 'Dùng lịch riêng' cho 1 carrier → enable/disable day rows + copy global template."""
+        day_rows_widget.setEnabled(checked)
+        if checked:
+            # Copy global template vào carrier tab khi bật lịch riêng
+            for idx in range(7):
+                if self._carrier_day_checkboxes[carrier_key][idx].isChecked():
+                    self._carrier_day_time_edits[carrier_key][idx].setText(
+                        self.weekly_day_time_edits[idx].text()
+                    )
+
+    def _find_next_run_today(self, now: datetime, schedule: dict) -> datetime | None:
+        """Tìm timeslot tiếp theo trong ngày hôm nay cho 1 schedule cụ thể. Trả về None nếu hôm nay hết slot."""
         day_idx = now.weekday()  # Python: 0=Monday → khớp với idx của ta
-        slots = self._sched_weekly_config.get(day_idx, [])
+        slots = schedule.get(day_idx, [])
         best = None
         for h, m in slots:
             candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -3069,19 +3187,21 @@ class App(QMainWindow):
         return best
 
     def _calc_next_weekly_run(self, from_time: datetime) -> datetime | None:
-        """Quét tối đa 8 ngày tới, tìm timeslot sớm nhất. Dùng cho countdown display."""
+        """Quét tối đa 8 ngày tới, tìm timeslot sớm nhất từ TẤT CẢ schedules. Dùng cho countdown display."""
         best = None
-        for offset in range(8):
-            check_date = from_time.date() + timedelta(days=offset)
-            day_idx = check_date.weekday()
-            day_slots = self._sched_weekly_config.get(day_idx, [])
-            for h, m in day_slots:
-                candidate = datetime(check_date.year, check_date.month, check_date.day, h, m, 0, 0)
-                if candidate > from_time and (best is None or candidate < best):
-                    best = candidate
-            # Nếu đã tìm thấy slot trong ngày đang xét thì dừng (không cần quét tiếp)
-            if best is not None and best.date() == check_date:
-                break
+        # Gom tất cả schedules (global + per-carrier)
+        all_schedules = [s for s in self._sched_weekly_config.values() if s]
+        for schedule in all_schedules:
+            for offset in range(8):
+                check_date = from_time.date() + timedelta(days=offset)
+                day_idx = check_date.weekday()
+                day_slots = schedule.get(day_idx, [])
+                for h, m in day_slots:
+                    candidate = datetime(check_date.year, check_date.month, check_date.day, h, m, 0, 0)
+                    if candidate > from_time and (best is None or candidate < best):
+                        best = candidate
+                # Nếu đã tìm thấy slot trong ngày đang xét từ schedule này, dừng quét schedule này
+                # (vẫn tiếp tục quét schedule khác vì có thể có slot sớm hơn)
         return best
 
     # ═══════════════════════════════════════════════════════
@@ -3105,26 +3225,53 @@ class App(QMainWindow):
                 self._update_countdown()
         elif self._sched_mode == "weekly":
             now = datetime.now()
-            next_today = self._find_next_run_today(now)
-            if next_today is not None:
-                self._sched_next_run = next_today
-                diff = (next_today - now).total_seconds()
-                if diff <= 1:
-                    if not self._sched_last_run or (now - self._sched_last_run).total_seconds() > 60:
-                        self._execute_scheduled_job()
+            # ── Gom carrier nào đến giờ chạy ──
+            due_carriers = []  # list of carrier names (str)
+            all_carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
+            carrier_names_map = {"ghn": "GHN", "jt": "J&T", "vnp": "VietNam Post", "best": "Best Express", "viettel": "Viettel Post", "jtc": "J&T Cargo"}
+
+            # Tìm next slot sớm nhất để hiển thị countdown
+            best_next = None
+
+            for c_name in all_carrier_keys:
+                # Chọn schedule: carrier riêng nếu có, không thì global
+                if self._sched_carrier_custom.get(c_name) and c_name in self._sched_weekly_config:
+                    sched = self._sched_weekly_config[c_name]
                 else:
-                    self._update_countdown()
+                    sched = self._sched_weekly_config.get("", {})
+
+                if not sched:
+                    continue
+
+                next_slot = self._find_next_run_today(now, sched)
+                if next_slot is not None:
+                    diff = (next_slot - now).total_seconds()
+                    if diff <= 1:
+                        # ── Carrier này đến giờ chạy ──
+                        if not self._sched_last_run or (now - self._sched_last_run).total_seconds() > 60:
+                            due_carriers.append(carrier_names_map[c_name])
+                    if best_next is None or next_slot < best_next:
+                        best_next = next_slot
+
+            if due_carriers:
+                # Chạy job với carrier filter
+                self._sched_next_run = best_next
+                self._execute_scheduled_job(carrier_filter=due_carriers)
+            elif best_next is not None:
+                self._sched_next_run = best_next
+                self._update_countdown()
             else:
                 self._sched_next_run = self._calc_next_weekly_run(now)
                 self._update_countdown()
 
-    def _execute_scheduled_job(self):
+    def _execute_scheduled_job(self, carrier_filter=None):
         if self.running:
             self._log_html("dim", "⏭ Bỏ qua chu kỳ — job trước vẫn đang chạy")
             return
-        config = self._collect_config()
+        config = self._collect_config(carrier_filter=carrier_filter)
         if not config['carriers']:
-            self._log_html("warn", "⏭ Bỏ qua chu kỳ — không có hãng nào được chọn")
+            carrier_info = f" [{', '.join(carrier_filter)}]" if carrier_filter else ""
+            self._log_html("warn", f"⏭ Bỏ qua chu kỳ{carrier_info} — không có hãng nào được chọn")
             return
 
         # ── Tính output_dir với date + time subfolder ──
@@ -3138,7 +3285,8 @@ class App(QMainWindow):
 
         self.running = True
         self._clear_results()
-        self.status_label.setText("🔄 Đang chạy tác vụ tự động...")
+        carrier_info = f" [{', '.join(carrier_filter)}]" if carrier_filter else ""
+        self.status_label.setText(f"🔄 Đang chạy tác vụ tự động{carrier_info}...")
         self.status_label.setStyleSheet("color: #D97706; font-weight: bold; font-size: 14px;")
         self.trigger_job.emit(config)
 
@@ -3156,6 +3304,27 @@ class App(QMainWindow):
     def _save_config(self):
         """Lưu cấu hình hiện tại ra file JSON."""
         carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
+
+        # ── Serialize weekly schedule (global + per-carrier) ──
+        weekly_data = {}
+        # Global ("Tất cả" tab)
+        weekly_data[""] = {
+            'days': {str(idx): {
+                'checked': self.weekly_day_checkboxes[idx].isChecked(),
+                'times': self.weekly_day_time_edits[idx].text(),
+            } for idx in range(7)},
+        }
+        # Per-carrier
+        for c_key in carrier_keys:
+            if c_key in self._carrier_day_checkboxes:
+                weekly_data[c_key] = {
+                    'use_custom': self._carrier_use_custom_cb.get(c_key) and self._carrier_use_custom_cb[c_key].isChecked(),
+                    'days': {str(idx): {
+                        'checked': self._carrier_day_checkboxes[c_key][idx].isChecked(),
+                        'times': self._carrier_day_time_edits[c_key][idx].text(),
+                    } for idx in range(7)},
+                }
+
         data = {
             'cookie': self._cookie_real,
             'master': self._master_real,
@@ -3173,6 +3342,7 @@ class App(QMainWindow):
             'exclude_pre_orders': self.exclude_pre_orders_cb.isChecked(),
             'sched_mode': self._sched_mode,
             'sched_interval_hours': self._sched_interval_hours,
+            'weekly_schedule': weekly_data,  # NEW: per-carrier schedule
         }
         try:
             self._config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -3218,6 +3388,33 @@ class App(QMainWindow):
 
         self._sched_mode = data.get('sched_mode', 'weekly')
         self._sched_interval_hours = data.get('sched_interval_hours', 1)
+
+        # ── Restore weekly schedule (global + per-carrier) ──
+        weekly_data = data.get('weekly_schedule', {})
+        if weekly_data:
+            # Global ("Tất cả" tab)
+            global_data = weekly_data.get("", {}).get('days', {})
+            for idx_str, day_data in global_data.items():
+                idx = int(idx_str)
+                if idx in self.weekly_day_checkboxes:
+                    self.weekly_day_checkboxes[idx].setChecked(day_data.get('checked', idx < 6))
+                    self.weekly_day_time_edits[idx].setText(day_data.get('times', ''))
+                    self.weekly_day_time_edits[idx].setEnabled(day_data.get('checked', idx < 6))
+            # Per-carrier
+            carrier_keys = ["ghn", "jt", "vnp", "best", "viettel", "jtc"]
+            for c_key in carrier_keys:
+                c_data = weekly_data.get(c_key, {})
+                if c_key in self._carrier_use_custom_cb:
+                    use_custom = c_data.get('use_custom', False)
+                    self._carrier_use_custom_cb[c_key].setChecked(use_custom)
+                if c_key in self._carrier_day_checkboxes:
+                    days_data = c_data.get('days', {})
+                    for idx_str, day_data in days_data.items():
+                        idx = int(idx_str)
+                        if idx in self._carrier_day_checkboxes[c_key]:
+                            self._carrier_day_checkboxes[c_key][idx].setChecked(day_data.get('checked', idx < 6))
+                            self._carrier_day_time_edits[c_key][idx].setText(day_data.get('times', ''))
+                            self._carrier_day_time_edits[c_key][idx].setEnabled(day_data.get('checked', idx < 6) and use_custom)
 
         self.cookie_row.set_path(self._cookie_real)
         self.master_row.set_path(self._master_real)
