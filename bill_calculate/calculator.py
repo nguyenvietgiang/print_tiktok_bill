@@ -1035,7 +1035,14 @@ def process_all(
     prefix = f"Phieu_xuat_hang_{carrier_safe}_" if carrier_safe else "Phieu_xuat_hang_"
     output_path = os.path.join(output_dir, f"{prefix}{now.strftime('%m-%d_%H-%M-%S')}.xlsx")
 
-    fill_template(results, template_path, output_path, carrier=carrier, order_count=total_order_qty)
+    # ── Số đơn cho tiêu đề: ưu tiên "Order quantity" trong header PDF.
+    # Nếu PDF không có dòng đó (vd chỉ có Shipping label) hoặc parse không ra
+    # → fallback sang số Order ID đã gom được (chính xác = số đơn thực).
+    order_count_for_title = total_order_qty
+    if order_count_for_title <= 0 and all_order_ids:
+        order_count_for_title = len(all_order_ids)
+
+    fill_template(results, template_path, output_path, carrier=carrier, order_count=order_count_for_title)
 
     # ── Lưu danh sách Order ID ra file .txt ──
     if all_order_ids:

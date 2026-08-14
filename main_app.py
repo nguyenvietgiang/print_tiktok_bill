@@ -592,41 +592,62 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 page.wait_for_timeout(4000)
                 # Thử click "Tiếp tục" lần nữa (phòng overlay "Phí vận chuyển" đã biến mất)
                 _try_click_tieptuc('(sau "Tiếp theo")')
+            else:
+                log_cb('  ⏭ Không thấy nút "Tiếp theo" — vẫn kiểm tra hộp thoại chọn loại chứng từ/nhãn', 'dim')
+                # 📸 Chụp UI thật để đối chiếu nếu bug vẫn còn
+                try:
+                    ss = str(Path(output_dir) / f'debug_no_tieptheo_batch{batch_num}.png')
+                    page.screenshot(path=ss)
+                    log_cb(f'  📸 Screenshot: {ss}', 'dim')
+                except: pass
 
-                state_cb('printing', f'Batch {batch_num}: Chọn loại chứng từ...')
-                page.wait_for_timeout(3000)
-                for doc_label in ['Danh sách đóng gói', 'Danh sách lấy hàng']:
+            # ── Chọn loại chứng từ / nhãn vận chuyển (LUÔN chạy, KHÔNG gate theo "Tiếp theo") ──
+            # TikTok CÓ LÚC hiện hộp thoại chọn này, CÓ LÚC không → phải poll + delay cho web
+            # kịp mở dialog, có checkbox thì tick, không có thì bỏ qua rồi vẫn đi tải xuống.
+            state_cb('printing', f'Batch {batch_num}: Chọn loại chứng từ/nhãn (nếu có)...')
+            page.wait_for_timeout(3000)  # chờ dialog tải xong sau khi bấm
+            doc_labels = ['Danh sách đóng gói', 'Danh sách lấy hàng',
+                          'Shipping label', 'Nhãn vận chuyển']
+            found_any_doc = False
+            for _ in range(15):  # poll tối đa 15s cho các checkbox xuất hiện (dialog load chậm)
+                for doc_label in doc_labels:
                     try:
                         lbl = page.locator('label').filter(has_text=doc_label).first
                         if lbl.count() > 0:
                             inp = lbl.locator('input')
-                            if inp.count() > 0 and not inp.is_checked():
-                                lbl.click(); page.wait_for_timeout(500)
-                                log_cb(f'  ✓ Đã tick: {doc_label}', 'ok')
+                            if inp.count() > 0:
+                                found_any_doc = True
+                                if not inp.is_checked():
+                                    lbl.click(); page.wait_for_timeout(500)
+                                    log_cb(f'  ✓ Đã tick: {doc_label}', 'ok')
                     except: pass
-                page.wait_for_timeout(2000)
-                # Thử click "Tiếp tục" lần nữa trước khi in
-                _try_click_tieptuc('(trước "In nhãn ngay")')
+                if found_any_doc:
+                    break  # đã thấy dialog → đủ điều kiện, không cần poll tiếp
+                page.wait_for_timeout(1000)
+            if not found_any_doc:
+                log_cb('  ℹ Không có hộp thoại chọn loại chứng từ/nhãn — bỏ qua', 'dim')
+            page.wait_for_timeout(2000)
+            # Thử click "Tiếp tục" lần nữa trước khi in
+            _try_click_tieptuc('(trước "In nhãn ngay")')
 
-                in_btn = None
-                for btn_text in ['In nhãn ngay sau khi vận chuyển', 'In nhãn ngay', 'Print label immediately']:
+            # ── "In nhãn ngay" là TÙY CHỌN: có thì bấm, không có thì vẫn đi tải ──
+            in_btn = None
+            for btn_text in ['In nhãn ngay sau khi vận chuyển', 'In nhãn ngay', 'Print label immediately']:
+                try:
+                    btn = page.locator(f'button:has-text("{btn_text}")').first
+                    if btn.count() > 0 and btn.is_visible(timeout=2000): in_btn = btn; break
+                except: pass
+            if not in_btn:
+                for b in page.locator('button').all():
                     try:
-                        btn = page.locator(f'button:has-text("{btn_text}")').first
-                        if btn.count() > 0 and btn.is_visible(timeout=2000): in_btn = btn; break
+                        txt = b.inner_text().strip().lower()
+                        if 'in nhãn' in txt or 'in nhan' in txt: in_btn = b; break
                     except: pass
-                if not in_btn:
-                    for b in page.locator('button').all():
-                        try:
-                            txt = b.inner_text().strip().lower()
-                            if 'in nhãn' in txt or 'in nhan' in txt: in_btn = b; break
-                        except: pass
-                if in_btn:
-                    in_btn.click(timeout=5000)
-                    log_cb('  ✓ Đã bấm "In nhãn ngay"', 'ok')
-                    page.wait_for_timeout(3000)
-                else: log_cb('  ⚠ Không tìm thấy nút "In nhãn ngay"', 'warn')
-            else:
-                log_cb('  ⏭ Không có popup "Tiếp theo" → đi thẳng bước tải xuống', 'info')
+            if in_btn:
+                in_btn.click(timeout=5000)
+                log_cb('  ✓ Đã bấm "In nhãn ngay"', 'ok')
+                page.wait_for_timeout(3000)
+            else: log_cb('  ⚠ Không tìm thấy nút "In nhãn ngay" — đi tải với mặc định hệ thống', 'warn')
 
             state_cb('downloading', f'Batch {batch_num}: Đợi popup "Tải xuống tất cả"...')
             taixuong_btn = None
@@ -773,6 +794,33 @@ def _send_order_ids_to_api(order_ids, log_cb, url=None):
     except Exception as e:
         log_cb(f'  ⚠ Lỗi gửi Order ID lên API: {e}', 'warn')
         return False
+
+
+# ============================================================
+# CARRIER DETECTION (tên file)
+# ============================================================
+CARRIER_DETECT_RULES = [
+    ('ghn', 'GHN'),
+    ('j&t cargo', 'J&T Cargo VN'),
+    ('vietnam post', 'VietNam Post'),
+    ('best express', 'Best Express'),
+    ('jnt', 'J&T'),
+    ('j&t', 'J&T'),
+    ('vietnam', 'VietNam Post'),
+    ('vnp', 'VietNam Post'),
+    ('best', 'Best Express'),
+    ('viettel', 'Viettel Post'),
+    ('jtc', 'J&T Cargo VN'),
+]
+
+
+def _detect_carrier_from_filename(fname: str) -> str:
+    """Nhận diện hãng vận chuyển từ tên file (GHN_..., JnT_..., ...). Trả về '' nếu không rõ."""
+    fn = fname.lower()
+    for key, label in CARRIER_DETECT_RULES:
+        if key in fn:
+            return label
+    return ''
 
 
 # ============================================================
@@ -2360,9 +2408,20 @@ class App(QMainWindow):
 
         def _run():
             self._test_log.emit("info", "🧪 TEST: Bắt đầu tính toán...")
+            # ── Tự nhận diện carrier từ tên file → xuất đúng "ĐVVC" trên báo cáo ──
+            # Chỉ dùng khi TẤT CẢ file cùng 1 hãng; trộn nhiều hãng → để trống (gộp tất cả)
+            detected = set()
+            for p in pdfs:
+                c = _detect_carrier_from_filename(Path(p).name)
+                if c:
+                    detected.add(c)
+            carrier = detected.pop() if len(detected) == 1 else ''
+            if carrier:
+                self._test_log.emit("info", f"  🚚 Nhận diện carrier từ tên file: {carrier}")
             try:
                 results = run_calculator(pdfs, out_dir, master, retail, template,
                                          lambda m, t='': self._test_log.emit(t, m),
+                                         carrier=carrier,
                                          send_order_ids=self._test_send_api_cb.isChecked())
                 for r in results:
                     self._test_log.emit("ok", f"  ✓ {r['rows']} SKU | Qty={r['tong_qty']} | Sold={r['tong_sold']} | Promo={r['tong_promo']}")
@@ -2430,19 +2489,17 @@ class App(QMainWindow):
         batch_size = self.batch_size_spin.value()
 
         def _run():
-            # Gom tất cả file theo carrier
+            # Gom tất cả file theo carrier (nhận diện từ tên file)
             do_print = auto_print and printer
             if not do_print:
                 self._test_log.emit("warn", "⚠ In bị tắt — tick 'In tự động ra máy in' ở tab Cấu hình In để in")
-            carrier_map = {'JnT': 'J&T', 'GHN': 'GHN', 'VietNam': 'VietNam Post',
-                           'Best': 'Best Express', 'Viettel': 'Viettel Post', 'JTC': 'J&T Cargo VN'}
 
             # Nhóm file theo carrier: {carrier: {picking: [...], shipping: [...]}}
+            # File không nhận diện được hãng (vd tên cũ chỉ có thời gian) → gom vào "Tất cả"
             by_carrier = {}
             for f in all_files:
                 fname = Path(f).name
-                prefix = fname.split('_')[0]
-                carrier = carrier_map.get(prefix, prefix)
+                carrier = _detect_carrier_from_filename(fname) or 'Tất cả'
                 if carrier not in by_carrier:
                     by_carrier[carrier] = {'picking': [], 'shipping': []}
                 if 'shipping' in fname.lower() or 'vận chuyển' in fname.lower():
