@@ -801,6 +801,7 @@ def _send_order_ids_to_api(order_ids, log_cb, url=None):
 # ============================================================
 CARRIER_DETECT_RULES = [
     ('ghn', 'GHN'),
+    ('jnt_cargo', 'J&T Cargo VN'),  # phải trước 'jnt' — 'JnT_Cargo_VN_...' chứa 'jnt'
     ('j&t cargo', 'J&T Cargo VN'),
     ('vietnam post', 'VietNam Post'),
     ('best express', 'Best Express'),
@@ -2187,6 +2188,14 @@ class App(QMainWindow):
         self.sched_button_group.buttonClicked.connect(self._on_schedule_mode_changed)
 
         layout.addWidget(gb)
+
+        # ── Chỉ báo trạng thái lịch trình — hiển thị NGAY TRONG TAB, không phụ thuộc log/thanh dưới ──
+        self.sched_status_label = QLabel("💤 Chưa bật lịch — bấm ▶ CHẠY để kích hoạt lịch trình")
+        self.sched_status_label.setWordWrap(True)
+        self.sched_status_label.setStyleSheet(
+            "font-weight: bold; font-size: 13px; padding: 12px 16px;"
+            "background: #F1F5F9; color: #64748B; border-radius: 8px;")
+        layout.addWidget(self.sched_status_label)
         layout.addStretch()
         scroll.setWidget(w)
         return scroll
@@ -3079,6 +3088,7 @@ class App(QMainWindow):
         self.status_label.setStyleSheet("color: #D97706; font-weight: bold; font-size: 14px;")
         self.trigger_job.emit(config)
 
+    @staticmethod
     def _parse_weekly_times(day_checkboxes, day_time_edits, day_names):
         """Parse time strings from day rows. Returns {day_idx: [(h, m), ...]} or None if error."""
         result = {}
@@ -3105,7 +3115,11 @@ class App(QMainWindow):
 
     def _on_run_schedule(self):
         if not Path(self._cookie_real).exists():
-            QMessageBox.critical(self, "Lỗi", "Chọn file cookie JSON hợp lệ.")
+            QMessageBox.critical(self, "Lỗi",
+                "Chưa có file cookie TikTok hợp lệ!\n\n"
+                "Mở tab 'Tệp dữ liệu' → bấm 'Chọn' cạnh '🍪 Cookie (JSON)'\n"
+                "và chọn file cookie đã export từ seller-vn.tiktok.com.\n"
+                "Không có cookie thì bot không đăng nhập được để chạy.")
             return
         mode = self._sched_mode
         if mode == "once":
@@ -3118,7 +3132,7 @@ class App(QMainWindow):
             has_any = False
 
             # ── Parse global schedule ("Tất cả" tab) ──
-            global_config, err = _parse_weekly_times(self.weekly_day_checkboxes, self.weekly_day_time_edits, day_names)
+            global_config, err = self._parse_weekly_times(self.weekly_day_checkboxes, self.weekly_day_time_edits, day_names)
             if err:
                 QMessageBox.critical(self, "Lỗi", err)
                 return
@@ -3132,7 +3146,7 @@ class App(QMainWindow):
                 use_custom = self._carrier_use_custom_cb.get(c_key) and self._carrier_use_custom_cb[c_key].isChecked()
                 self._sched_carrier_custom[c_key] = use_custom
                 if use_custom:
-                    carrier_config, err = _parse_weekly_times(
+                    carrier_config, err = self._parse_weekly_times(
                         self._carrier_day_checkboxes[c_key],
                         self._carrier_day_time_edits[c_key],
                         day_names)
@@ -3180,7 +3194,17 @@ class App(QMainWindow):
         self._sched_last_run = None
         self._set_buttons("scheduled")
         self._sched_timer.start()
+
+        # ── Phản hồi TỨC THÌ: tính ngay giờ chạy kế tiếp (không đợi 1s timer tick) ──
+        if mode == "weekly":
+            self._sched_next_run = self._calc_next_weekly_run(datetime.now())
+        else:  # interval
+            self._sched_next_run = datetime.now() + timedelta(hours=self._sched_interval_hours)
         self._update_countdown()
+        if self._sched_next_run:
+            self._log_html("bold_ok", f"🟢 ĐÃ BẬT LỊCH (chế độ {mode}) — {self.sched_status_label.text()}")
+        else:
+            self._log_html("warn", "⚠ Không tìm thấy giờ chạy nào trong 8 ngày tới — kiểm tra lại: ngày đã tick, giờ đã nhập đúng định dạng HH:MM.")
 
     def _on_stop(self):
         self.scheduler_active = False
@@ -3197,6 +3221,11 @@ class App(QMainWindow):
         self.status_label.setText("⏹ Đã dừng")
         self.status_label.setStyleSheet("color: #DC2626; font-weight: bold; font-size: 14px;")
         self._log_html("warn", "⏹ Đã dừng hệ thống")
+        if hasattr(self, 'sched_status_label'):
+            self.sched_status_label.setText("⏹ Lịch đã dừng — bấm ▶ CHẠY để kích hoạt lại")
+            self.sched_status_label.setStyleSheet(
+                "font-weight: bold; font-size: 13px; padding: 12px 16px;"
+                "background: #FEF2F2; color: #DC2626; border-radius: 8px;")
 
     def _on_schedule_mode_changed(self, btn: QRadioButton):
         mode = btn.property("mode")
@@ -3352,8 +3381,29 @@ class App(QMainWindow):
             remaining = self._sched_next_run - datetime.now()
             secs = max(0, int(remaining.total_seconds()))
             h, m = secs // 3600, (secs % 3600) // 60
-            self.status_label.setText(f"⏳ Chạy tiếp sau {h}h{m:02d}")
+            d = h // 24
+            hh = h % 24
+            when_str = f"⏳ {d} ngày {hh}h{m:02d} nữa" if d > 0 else f"⏳ {hh}h{m:02d} nữa"
+            self.status_label.setText(when_str)
             self.status_label.setStyleSheet("color: #2563EB; font-weight: bold; font-size: 14px;")
+
+            # ── Cập nhật chỉ báo trong tab Lịch trình ──
+            if hasattr(self, 'sched_status_label'):
+                target = self._sched_next_run
+                now = datetime.now()
+                day_diff = (target.date() - now.date()).days
+                if day_diff == 0:
+                    day_txt = "hôm nay"
+                elif day_diff == 1:
+                    day_txt = "ngày mai"
+                else:
+                    day_names = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
+                    day_txt = day_names[target.weekday()]
+                self.sched_status_label.setText(
+                    f"🟢 LỊCH ĐÃ KÍCH HOẠT — lần chạy kế tiếp: {day_txt} lúc {target.strftime('%H:%M')}  ({when_str})")
+                self.sched_status_label.setStyleSheet(
+                    "font-weight: bold; font-size: 13px; padding: 12px 16px;"
+                    "background: #ECFDF5; color: #047857; border-radius: 8px;")
 
     # ═══════════════════════════════════════════════════════
     # CONFIG PERSISTENCE

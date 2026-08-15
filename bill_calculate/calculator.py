@@ -1050,7 +1050,7 @@ def process_all(
         with open(order_id_path, 'w', encoding='utf-8') as f:
             f.write(f"# Order ID — {carrier or 'tat ca'} — {now.strftime('%d/%m/%Y %H:%M:%S')}\n")
             f.write(f"# Tong: {len(all_order_ids)} Order ID\n")
-            f.write(f"# SL don: {total_order_qty}\n")
+            f.write(f"# SL don: {order_count_for_title}\n")
             f.write(f"# SL mat hang: {sum(merged_order_counts.values())}\n\n")
             for oid in sorted(all_order_ids):
                 f.write(oid + '\n')
