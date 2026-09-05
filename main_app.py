@@ -9,6 +9,14 @@ import os, sys, json, shutil, threading, re as _re
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# ── Ép stdout/stderr dùng UTF-8 — tránh crash khi print() gặp emoji
+# (⚠, 📊...) trên console đang dùng bảng mã cp1252/cp1258 thay vì UTF-8.
+# sys.stdout có thể là None khi build windowed (console=False) nên phải guard.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, 'reconfigure'):
+        try: _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception: pass
+
 # ═══════════════════════════════════════════════════════════
 # PySide6 imports
 # ═══════════════════════════════════════════════════════════
@@ -672,6 +680,45 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 
             log_cb('  📥 Đang bấm nút tải xuống...', 'info')
 
+            # ── Click "chịu khó" — normal click hay bị treo nếu có overlay vô hình
+            # chặn pointer event (vd toast/backdrop đang fade out) → fallback force
+            # click rồi JS dispatch, tránh làm crash toàn bộ automation.
+            def _robust_click(btn, desc=''):
+                try:
+                    btn.click(timeout=5000)
+                    return True
+                except Exception as e1:
+                    log_cb(f'  ⚠ Click thường thất bại {desc} ({e1}) — thử force click...', 'warn')
+                try:
+                    btn.click(timeout=3000, force=True)
+                    return True
+                except Exception as e2:
+                    log_cb(f'  ⚠ Force click thất bại {desc} ({e2}) — thử JS click...', 'warn')
+                try:
+                    btn.dispatch_event('click')
+                    return True
+                except Exception as e3:
+                    log_cb(f'  ✗ Không thể click {desc}: {e3}', 'err')
+                    # ── Chẩn đoán: cả 3 cách đều fail — chụp lại phần tử đang thực
+                    # sự nằm ở đúng toạ độ nút để xác nhận có bị che hay không ──
+                    try:
+                        box = btn.bounding_box()
+                        if box:
+                            cx = box['x'] + box['width'] / 2
+                            cy = box['y'] + box['height'] / 2
+                            blocker = page.evaluate(
+                                "([x, y]) => { const el = document.elementFromPoint(x, y); "
+                                "return el ? (el.tagName + '.' + (el.className || '') + ' | text=' + "
+                                "(el.innerText || '').slice(0, 40)) : 'none'; }",
+                                [cx, cy])
+                            log_cb(f'  🔍 Phần tử thực tế tại vị trí nút: {blocker}', 'dim')
+                        ss = str(Path(output_dir) / f'debug_click_fail_batch{batch_num}_{datetime.now().strftime("%H-%M-%S")}.png')
+                        page.screenshot(path=ss)
+                        log_cb(f'  📸 Screenshot chẩn đoán: {ss}', 'dim')
+                    except Exception as diag_err:
+                        log_cb(f'  ⚠ Không chụp được chẩn đoán: {diag_err}', 'dim')
+                    return False
+
             # ── Download với retry (tối đa 3 lần) ──
             MAX_DOWNLOAD_RETRIES = 3
             download_ok = False
@@ -689,8 +736,10 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                                 retry_btn = btn; break
                         except: pass
                     if retry_btn:
-                        retry_btn.click(timeout=5000)
-                        log_cb('  ✓ Đã click lại "Tải xuống tất cả"', 'ok')
+                        if _robust_click(retry_btn, '(retry "Tải xuống tất cả")'):
+                            log_cb('  ✓ Đã click lại "Tải xuống tất cả"', 'ok')
+                        else:
+                            continue
                     else:
                         log_cb('  ⚠ Popup tải xuống đã biến mất — không thể retry', 'warn')
                         break
@@ -710,8 +759,11 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 
                 page.on('download', on_download)
                 if retry_attempt == 0:
-                    taixuong_btn.click(timeout=5000)
-                    log_cb('  ✓ Đã bấm "Tải xuống tất cả"', 'ok')
+                    if _robust_click(taixuong_btn, '("Tải xuống tất cả")'):
+                        log_cb('  ✓ Đã bấm "Tải xuống tất cả"', 'ok')
+                    else:
+                        page.remove_listener('download', on_download)
+                        continue
                 # Chờ download hoàn tất: tối đa 3 phút mỗi lần retry
                 idle_ticks = 0
                 for _ in range(18):  # 18 × 10s = 3 phút tối đa

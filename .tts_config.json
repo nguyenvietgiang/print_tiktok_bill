@@ -1,0 +1,272 @@
+{
+  "cookie": "C:/Users/giangnv/Downloads/seller-vn.tiktok.com_05-09-2026.json",
+  "master": "C:/Users/giangnv/Downloads/bot/mã combo.xlsx",
+  "retail": "C:/Users/giangnv/Downloads/bot/sp bán lẻ.xlsx",
+  "template": "D:\\GiangnvProject\\TraphacoRepo\\bot-print\\Tiktok_bill\\print_tiktok_bill\\Bảng thống kê hàng.xlsx",
+  "output_dir": "D:/GiangnvProject/TraphacoRepo/bot-print/Tiktok_bill/print_tiktok_bill/outputs",
+  "carriers": {
+    "ghn": {
+      "checked": false,
+      "count": 0
+    },
+    "jt": {
+      "checked": false,
+      "count": 0
+    },
+    "vnp": {
+      "checked": false,
+      "count": 0
+    },
+    "best": {
+      "checked": true,
+      "count": 0
+    },
+    "viettel": {
+      "checked": false,
+      "count": 0
+    },
+    "jtc": {
+      "checked": false,
+      "count": 0
+    }
+  },
+  "auto_print": false,
+  "printer": "HP LaserJet Pro M402-M403 n-dne PCL-6",
+  "duplex": 0,
+  "batch_size": 0,
+  "exclude_pre_orders": false,
+  "sched_mode": "once",
+  "sched_interval_hours": 1,
+  "weekly_schedule": {
+    "": {
+      "days": {
+        "0": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "1": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "2": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "3": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "4": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "5": {
+          "checked": true,
+          "times": "07:30, 13:20, 15:10, 16:10, 17:10, 18:10"
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "ghn": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "jt": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "vnp": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "best": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "viettel": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    },
+    "jtc": {
+      "use_custom": false,
+      "days": {
+        "0": {
+          "checked": false,
+          "times": ""
+        },
+        "1": {
+          "checked": false,
+          "times": ""
+        },
+        "2": {
+          "checked": false,
+          "times": ""
+        },
+        "3": {
+          "checked": false,
+          "times": ""
+        },
+        "4": {
+          "checked": false,
+          "times": ""
+        },
+        "5": {
+          "checked": false,
+          "times": ""
+        },
+        "6": {
+          "checked": false,
+          "times": ""
+        }
+      }
+    }
+  }
+}
