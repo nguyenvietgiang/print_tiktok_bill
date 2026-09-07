@@ -142,6 +142,25 @@ def _detect_captcha(page, log_cb, state_cb, stop_event, output_dir=''):
         except Exception:
             continue
 
+def _wait_orders_table_ready(page, max_wait_ms=15000, poll_ms=800):
+    """Đợi bảng đơn hàng render xong bằng cách đếm số checkbox ổn định qua 2 lần
+    đọc liên tiếp, thay vì đợi 1 khoảng thời gian cố định — tránh trường hợp mạng/
+    server chậm khiến đọc thiếu đơn (bảng chưa render hết đã vội đếm)."""
+    prev = -1
+    elapsed = 0
+    count = 0
+    while elapsed < max_wait_ms:
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+        try:
+            count = page.evaluate("() => document.querySelectorAll('td.col-checkbox label.p-checkbox').length")
+        except Exception:
+            count = 0
+        if count > 0 and count == prev:
+            return count
+        prev = count
+    return count
+
 def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_event=None,
                    existing_playwright=None, existing_browser=None, carrier=None, test_mode=False,
                    exclude_pre_orders=True):
@@ -185,7 +204,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                             p.close()
                     except Exception:
                         pass
-            page.goto(orders_url, wait_until='networkidle', timeout=60000)
+            page.goto(orders_url, wait_until='domcontentloaded', timeout=60000)
             page.wait_for_timeout(4000)
             _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
             browser_ok = True
@@ -299,7 +318,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             MAX_GOTO_RETRIES = 3
             for goto_attempt in range(MAX_GOTO_RETRIES):
                 try:
-                    page.goto(orders_url, wait_until='networkidle', timeout=60000)
+                    page.goto(orders_url, wait_until='domcontentloaded', timeout=60000)
                     break
                 except Exception as e:
                     if goto_attempt < MAX_GOTO_RETRIES - 1:
@@ -308,10 +327,10 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                     else:
                         log_cb(f'  ✗ Thất bại sau {MAX_GOTO_RETRIES} lần thử: {e}', 'err')
                         raise
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(1500)
             _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
 
-            total_avail = page.evaluate("() => document.querySelectorAll('td.col-checkbox label.p-checkbox').length")
+            total_avail = _wait_orders_table_ready(page)
             if total_avail == 0:
                 # Kiểm tra có phải do chưa đăng nhập hay thực sự hết đơn
                 try:
