@@ -191,8 +191,9 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             browser_ok = True
         except Exception as e:
             log_cb(f'⚠ Không dùng lại được browser cũ ({e}) — tạo mới...', 'warn')
-            # QUAN TRỌNG: chỉ close browser, KHÔNG stop playwright
-            # stop() gọi vào native code dễ gây crash nếu driver đang dở việc
+            # Chỉ close browser ở đây. KHÔNG null existing_playwright — để khối
+            # "if not browser_ok" bên dưới stop() nó (đã bọc try/except an toàn),
+            # tránh để lại driver cũ sống ngầm gây lỗi "Sync API inside asyncio loop".
             try:
                 existing_browser.close()
             except Exception:
@@ -201,7 +202,6 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             import time as _time
             _time.sleep(0.5)
             existing_browser = None
-            existing_playwright = None
 
     if not browser_ok:
         # ── Stop playwright cũ TRƯỚC KHI tạo mới ──
