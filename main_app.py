@@ -63,8 +63,6 @@ sys.path.insert(0, str(BILL_DIR))
 
 TARGET_URL = 'https://seller-vn.tiktok.com'
 ORDERS_URL = 'https://seller-vn.tiktok.com/order?order_status%5B%5D=1&selected_sort=11&tab=to_ship&page_size=50'
-CHROME_USER_DATA_DIR = BASE_DIR / '.chrome_profile'
-os.makedirs(CHROME_USER_DATA_DIR, exist_ok=True)
 CARRIER_URLS = {
     'GHN':           ORDERS_URL + '&shipping_provider_id%5B%5D=7252807945006614278',
     'J&T':           ORDERS_URL + '&shipping_provider_id%5B%5D=6841743441349706241',
@@ -267,21 +265,21 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 '--safebrowsing-disable-auto-update',
                 '--disable-search-engine-choice-screen',
             ]
-            log_cb('🌐 Dùng Google Chrome có sẵn trên máy (profile bền vững — cache giữ lại giữa các lần chạy)', 'info')
-            # launch_persistent_context: dùng 1 thư mục profile cố định thay vì
-            # tạo profile trắng mỗi lần → giữ cache DNS/JS/CSS/hình ảnh, load nhanh
-            # hơn từ lần chạy thứ 2. context.browser vẫn dùng is_connected()/contexts
-            # bình thường nên không phá logic tái sử dụng browser giữa các carrier.
-            context = playwright.chromium.launch_persistent_context(
-                str(CHROME_USER_DATA_DIR),
-                headless=False, channel='chrome', args=chrome_args,
-                viewport={'width': 1366, 'height': 768},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-                accept_downloads=True)
-            browser = context.browser
+            log_cb('🌐 Dùng Google Chrome có sẵn trên máy', 'info')
+            # QUAN TRỌNG: dùng profile TẠM, dùng xong bỏ (KHÔNG dùng
+            # launch_persistent_context với thư mục cố định) — đã thử profile bền
+            # vững nhưng gây crash Chrome giữa chừng khi đang tải/in (mất cả batch
+            # đơn hàng), trong khi profile tạm chạy ổn định xuyên suốt. Đổi tốc độ
+            # lấy sự ổn định vì mất đơn hàng thiệt hại nặng hơn nhiều so với việc
+            # load chậm hơn vài giây.
+            browser = playwright.chromium.launch(
+                headless=False, channel='chrome', args=chrome_args)
         except Exception as e:
             log_cb(f'✗ Không thể khởi động browser: {e}', 'err')
             raise RuntimeError(f'Không thể khởi động Chromium: {e}') from e
+        context = browser.new_context(viewport={'width': 1366, 'height': 768},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+            accept_downloads=True)
         pw_cookies = []
         for c in cookies_list:
             if not c.get('name') or not c.get('value'): continue
@@ -293,14 +291,7 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 pw['sameSite'] = {'strict':'Strict','lax':'Lax','no_restriction':'None','unspecified':'Lax'}.get(c['sameSite'],'Lax')
             pw_cookies.append(pw)
         context.add_cookies(pw_cookies)
-        # launch_persistent_context tự mở sẵn 1 tab trắng — dùng lại tab đó thay vì
-        # mở thêm tab mới rồi để tab trắng chạy nền vô ích.
-        page = context.pages[0] if context.pages else context.new_page()
-        for p in list(context.pages):
-            if p != page:
-                try:
-                    if not p.is_closed(): p.close()
-                except Exception: pass
+        page = context.new_page()
         page.goto(TARGET_URL, wait_until='domcontentloaded', timeout=30000)
         page.wait_for_timeout(2000)
         _detect_captcha(page, log_cb, state_cb, stop_event, output_dir)
