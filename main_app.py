@@ -161,7 +161,7 @@ def _wait_orders_table_ready(page, max_wait_ms=15000, poll_ms=800):
 
 def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_event=None,
                    existing_playwright=None, existing_browser=None, carrier=None, test_mode=False,
-                   exclude_pre_orders=True):
+                   exclude_pre_orders=True, round_cb=None):
     with open(cookie_path, 'r', encoding='utf-8') as f:
         cd = json.load(f)
     cookies_list = cd.get('cookies', cd if isinstance(cd, list) else [])
@@ -860,6 +860,17 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             total_printed += checked
             log_cb(f'  📊 Tiến độ: {total_printed}/{target} đơn, {len(pdf_files)} file PDF', 'info')
 
+            # ── Xử lý (in + tính bill) NGAY cho đợt vừa tải xong, nếu caller có
+            # truyền round_cb — tránh gộp chờ đến cuối: nếu đợt SAU lỗi mạng/tải
+            # (VD TikTok tự giới hạn 500-600 đơn/lần "chọn tất cả" nên phải chạy
+            # nhiều đợt), dữ liệu + nhãn của các đợt trước đã xử lý xong vẫn an
+            # toàn, không bị mất theo.
+            if round_cb and valid_files:
+                try:
+                    round_cb(list(valid_files))
+                except Exception as cb_err:
+                    log_cb(f'  ⚠ Lỗi xử lý đợt (in/tính bill): {cb_err}', 'warn')
+
             if force_stop:
                 log_cb('  ✓ Đã in hết đơn hiện có — hoàn thành.', 'ok'); break
             if checked < 20:
@@ -986,6 +997,67 @@ class AutomationWorker(QObject):
         self._stop_event = threading.Event()
         self._running = False
 
+    def _process_and_print_batch(self, pdf_paths, out_dir, master, retail, template,
+                                  printer, pdf_settings, batch_size, auto_print,
+                                  carrier, carrier_display, all_pdf_paths, all_results):
+        """In shipping label + tính bill cho MỘT lô file PDF (có thể là 1 đợt
+        con của 1 hãng vận chuyển, hoặc toàn bộ file của hãng đó)."""
+        for p in pdf_paths:
+            if Path(p).exists():
+                self.log_message.emit('info', f'📄 {Path(p).name}')
+                self.result_file.emit(str(p))
+        all_pdf_paths.extend(pdf_paths)
+        tag = 'ok' if pdf_paths else 'warn'
+        self.log_message.emit(tag, f'📥 [{carrier_display}]: đã tải {len(pdf_paths)} file PDF')
+
+        # In shipping label TRƯỚC, rồi mới tính toán
+        if auto_print and pdf_paths:
+            self.log_message.emit('info', f'🖨️ [{carrier_display}]: In shipping label...')
+            for p in pdf_paths:
+                if self._stop_event.is_set():
+                    self.log_message.emit('warn', '⏹ Đã dừng in — hủy các file còn lại.');
+                    break
+                name = Path(p).name
+                if not (Path(p).exists() and ('shipping' in name.lower() or 'vận chuyển' in name.lower())):
+                    continue
+                try:
+                    _print_file(str(p), printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                log_cb=lambda m, t='': self.log_message.emit(t, m))
+                    self.log_message.emit('ok', f'  ✓ Đã gửi in: {Path(p).name}')
+                except Exception as e:
+                    self.log_message.emit('err', f'  ✗ Lỗi in {Path(p).name}: {e}')
+
+        carrier_results = []
+        if pdf_paths and not self._stop_event.is_set():
+            self.log_message.emit('info', f'📊 Đang tính bill [{carrier_display}]...')
+            carrier_results = run_calculator(
+                pdf_paths, out_dir, master, retail, template,
+                lambda m, t='': self.log_message.emit(t, m),
+                carrier=carrier)
+            for r in carrier_results:
+                for key, lbl in [('xlsx_report', '📊')]:
+                    fp = r['files'].get(key)
+                    if fp and Path(fp).exists():
+                        self.log_message.emit('info', f'{lbl} {Path(fp).name}')
+                        self.result_file.emit(f'{lbl} {Path(fp).name}')
+            all_results.extend(carrier_results)
+
+        # In báo cáo sau khi tính toán
+        if auto_print and carrier_results and not self._stop_event.is_set():
+            for r in carrier_results:
+                if self._stop_event.is_set():
+                    self.log_message.emit('warn', '⏹ Đã dừng in báo cáo.');
+                    break
+                fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
+                if fp and Path(fp).exists():
+                    try:
+                        self.log_message.emit('info', f'  🖨️ In báo cáo: {Path(fp).name}')
+                        _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                    log_cb=lambda m, t='': self.log_message.emit(t, m))
+                        self.log_message.emit('ok', f'  ✓ Đã in báo cáo: {Path(fp).name}')
+                    except Exception as e:
+                        self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
+
     @Slot(dict)
     def start_job(self, config: dict):
         # ── Dọn dẹp browser cũ từ job trước (nếu có) ──
@@ -1039,75 +1111,68 @@ class AutomationWorker(QObject):
                 count_display = f'{count}' if count > 0 else 'tất cả'
                 self.log_message.emit('info', f'📥 Tải PDF [{carrier_display}] ({count_display} đơn)...')
 
-                pdf_paths, pw2, br2 = run_automation(
-                    cookie, out_dir, count,
-                    lambda m, t='': self.log_message.emit(t, m),
-                    lambda s, m: self.state_changed.emit(s, m),
-                    self._stop_event,
-                    existing_playwright=pw, existing_browser=br,
-                    carrier=carrier, test_mode=test_mode,
-                    exclude_pre_orders=exclude_pre_orders)
+                # ── Retry cả carrier nếu trình duyệt bị crash/ngắt kết nối giữa
+                # chừng (vd đang tải/in dở thì Chrome đóng) — tránh mất đơn hàng
+                # của carrier đó, kể cả khi đã tải được MỘT PHẦN trước khi crash
+                # (không chỉ riêng trường hợp 0 file). Đơn đã xử lý xong sẽ đổi
+                # trạng thái trên TikTok (không còn "chờ vận chuyển") nên lần thử
+                # lại chỉ tự động lấy đúng phần đơn CÒN LẠI, không bị trùng/in lại.
+                MAX_CARRIER_RETRIES = 2
 
-                if pw2: pw = pw2
-                if br2: br = br2
-                self._playwright = pw
-                self._browser = br
+                # ── count == 0 nghĩa là "tất cả" → TikTok có thể tự giới hạn số
+                # đơn chọn được trong 1 lần bấm "chọn tất cả" (VD 500-600 đơn),
+                # buộc bot phải chạy nhiều đợt mới lấy hết. Trường hợp này, in +
+                # tính bill NGAY sau mỗi đợt qua round_cb (thay vì gộp hết rồi mới
+                # xử lý 1 lần) — nếu đợt sau lỗi mạng/tải, nhãn + báo cáo của các
+                # đợt trước đã xử lý xong vẫn an toàn, không bị mất theo.
+                use_round_processing = (count == 0)
+                round_num = 0
 
-                for p in pdf_paths:
-                    if Path(p).exists():
-                        self.log_message.emit('info', f'📄 {Path(p).name}')
-                        self.result_file.emit(str(p))
-                all_pdf_paths.extend(pdf_paths)
-                tag = 'ok' if pdf_paths else 'warn'
-                self.log_message.emit(tag, f'📥 [{carrier_display}]: đã tải {len(pdf_paths)} file PDF')
+                def _round_cb(round_pdf_paths):
+                    nonlocal round_num
+                    round_num += 1
+                    label = f'{carrier_display} — đợt {round_num}'
+                    self.log_message.emit('info', f'📦 [{label}]: {len(round_pdf_paths)} file — xử lý ngay...')
+                    self._process_and_print_batch(round_pdf_paths, out_dir, master, retail, template,
+                                                   printer, pdf_settings, batch_size, auto_print,
+                                                   carrier, label, all_pdf_paths, all_results)
 
-                # In shipping label TRƯỚC, rồi mới tính toán
-                if auto_print and pdf_paths:
-                    self.log_message.emit('info', f'🖨️ [{carrier_display}]: In shipping label...')
-                    for p in pdf_paths:
-                        if self._stop_event.is_set():
-                            self.log_message.emit('warn', '⏹ Đã dừng in — hủy các file còn lại.');
-                            break
-                        name = Path(p).name
-                        if not (Path(p).exists() and ('shipping' in name.lower() or 'vận chuyển' in name.lower())):
-                            continue
-                        try:
-                            _print_file(str(p), printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                        log_cb=lambda m, t='': self.log_message.emit(t, m))
-                            self.log_message.emit('ok', f'  ✓ Đã gửi in: {Path(p).name}')
-                        except Exception as e:
-                            self.log_message.emit('err', f'  ✗ Lỗi in {Path(p).name}: {e}')
-
-                carrier_results = []
-                if pdf_paths and not self._stop_event.is_set():
-                    self.log_message.emit('info', f'📊 Đang tính bill [{carrier_display}]...')
-                    carrier_results = run_calculator(
-                        pdf_paths, out_dir, master, retail, template,
+                pdf_paths = []
+                for _carrier_attempt in range(MAX_CARRIER_RETRIES + 1):
+                    attempt_pdf_paths, pw2, br2 = run_automation(
+                        cookie, out_dir, count,
                         lambda m, t='': self.log_message.emit(t, m),
-                        carrier=carrier)
-                    for r in carrier_results:
-                        for key, lbl in [('xlsx_report', '📊')]:
-                            fp = r['files'].get(key)
-                            if fp and Path(fp).exists():
-                                self.log_message.emit('info', f'{lbl} {Path(fp).name}')
-                                self.result_file.emit(f'{lbl} {Path(fp).name}')
-                    all_results.extend(carrier_results)
+                        lambda s, m: self.state_changed.emit(s, m),
+                        self._stop_event,
+                        existing_playwright=pw, existing_browser=br,
+                        carrier=carrier, test_mode=test_mode,
+                        exclude_pre_orders=exclude_pre_orders,
+                        round_cb=(_round_cb if use_round_processing else None))
+                    pdf_paths.extend(attempt_pdf_paths)
 
-                # In báo cáo sau khi tính toán
-                if auto_print and carrier_results and not self._stop_event.is_set():
-                    for r in carrier_results:
-                        if self._stop_event.is_set():
-                            self.log_message.emit('warn', '⏹ Đã dừng in báo cáo.');
-                            break
-                        fp = r['files'].get('pdf_report') or r['files'].get('xlsx_report')
-                        if fp and Path(fp).exists():
-                            try:
-                                self.log_message.emit('info', f'  🖨️ In báo cáo: {Path(fp).name}')
-                                _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                            log_cb=lambda m, t='': self.log_message.emit(t, m))
-                                self.log_message.emit('ok', f'  ✓ Đã in báo cáo: {Path(fp).name}')
-                            except Exception as e:
-                                self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
+                    if pw2: pw = pw2
+                    if br2: br = br2
+                    self._playwright = pw
+                    self._browser = br
+
+                    browser_crashed = (br2 is not None and not br2.is_connected())
+                    if (browser_crashed and not self._stop_event.is_set()
+                            and _carrier_attempt < MAX_CARRIER_RETRIES):
+                        self.log_message.emit('warn',
+                            f'⚠ Trình duyệt bị ngắt giữa chừng khi xử lý [{carrier_display}] '
+                            f'(đã tải {len(attempt_pdf_paths)} file trước khi ngắt) '
+                            f'— thử lại phần đơn còn lại (lần {_carrier_attempt + 1}/{MAX_CARRIER_RETRIES})...')
+                        continue
+                    break
+
+                if use_round_processing:
+                    # Đã in + tính bill theo từng đợt ngay trong _round_cb ở trên.
+                    if round_num == 0:
+                        self.log_message.emit('warn', f'📥 [{carrier_display}]: không có đơn nào để xử lý')
+                else:
+                    self._process_and_print_batch(pdf_paths, out_dir, master, retail, template,
+                                                   printer, pdf_settings, batch_size, auto_print,
+                                                   carrier, carrier_display, all_pdf_paths, all_results)
 
             # ── Tất cả carriers hoàn thành ──
             self.log_message.emit('bold_ok', '🏁 HOÀN THÀNH!')
