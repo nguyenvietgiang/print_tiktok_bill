@@ -61,6 +61,12 @@ else:
 
 sys.path.insert(0, str(BILL_DIR))
 
+# Config lưu ở thư mục cố định của user (không nằm cạnh exe) để build/giải nén bản mới
+# không làm mất các đường dẫn file đã chọn.
+CONFIG_DIR = Path(os.environ.get('APPDATA') or Path.home()) / 'TikTokPrint'
+CONFIG_FILE = CONFIG_DIR / '.tts_config.json'
+LEGACY_CONFIG_FILE = BASE_DIR / '.tts_config.json'
+
 TARGET_URL = 'https://seller-vn.tiktok.com'
 ORDERS_URL = 'https://seller-vn.tiktok.com/order?order_status%5B%5D=1&selected_sort=11&tab=to_ship&page_size=50'
 CARRIER_URLS = {
@@ -1720,7 +1726,14 @@ class App(QMainWindow):
         self._build_ui()
 
         # ── Nạp cấu hình đã lưu từ lần trước ──
-        self._config_path = BASE_DIR / '.tts_config.json'
+        self._config_path = CONFIG_FILE
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            # Lần đầu sau khi đổi vị trí config: chép config cũ (cạnh exe/script) sang chỗ mới
+            if not CONFIG_FILE.exists() and LEGACY_CONFIG_FILE.exists():
+                shutil.copy2(LEGACY_CONFIG_FILE, CONFIG_FILE)
+        except OSError:
+            pass
         self._load_config()
 
         self._update_cookie_status()
@@ -2935,23 +2948,28 @@ class App(QMainWindow):
     def _on_cookie_changed(self, path: str):
         self._cookie_real = path
         self._update_cookie_status()
+        self._save_config()
 
     def _on_master_changed(self, path: str):
         self._master_real = path
         self._update_master_status()
         self._load_preview_data()
+        self._save_config()
 
     def _on_retail_changed(self, path: str):
         self._retail_real = path
         self._update_retail_status()
         self._load_preview_data()
+        self._save_config()
 
     def _on_template_changed(self, path: str):
         self._template_real = path
         self._update_template_status()
+        self._save_config()
 
     def _on_output_dir_changed(self, path: str):
         os.makedirs(path, exist_ok=True)
+        self._save_config()
 
     # ═══════════════════════════════════════════════════════
     # PREVIEW TABLE LOGIC WITH SEARCH
@@ -3638,12 +3656,14 @@ class App(QMainWindow):
 
         for key, attr in [('cookie', '_cookie_real'), ('master', '_master_real'),
                           ('retail', '_retail_real'), ('template', '_template_real')]:
+            # Giữ nguyên đường dẫn đã lưu kể cả khi file đang không tồn tại (đã bị di chuyển/xóa):
+            # ô vẫn hiện đường dẫn cũ + trạng thái ❌ thay vì bị xóa trống.
             saved = data.get(key, '')
-            if saved and Path(saved).exists():
+            if saved:
                 setattr(self, attr, saved)
 
         saved_out = data.get('output_dir', '')
-        if saved_out and Path(saved_out).exists():
+        if saved_out:
             self.output_row.set_path(saved_out)
             self.output_row._update_status_dir()
 
